@@ -1,0 +1,224 @@
+#VRML_SIM R2025a utf8
+
+WorldInfo {
+}
+Viewpoint {
+  orientation -0.3714576357318767 -0.37673088126522425 0.8485829764717248 4.518781458128897
+  position 0.5392814392448019 15.737500855335647 17.008151672965425
+}
+TexturedBackground {
+}
+TexturedBackgroundLight {
+}
+Floor {
+  tileSize 1 1
+}
+Solid {
+  translation 1.5 0 0.15
+  children [
+    Shape {
+      appearance PBRAppearance {
+        baseColor 0.7 0.4 0.2
+        roughness 1
+      }
+      geometry Box {
+        size 0.05 2 0.3
+      }
+    }
+  ]
+  name "wall_1"
+  boundingObject Box {
+    size 0.05 2 0.3
+  }
+}
+Solid {
+  translation -1.5 -1 0.15
+  children [
+    Shape {
+      appearance PBRAppearance {
+        baseColor 0.7 0.4 0.2
+        roughness 1
+      }
+      geometry Box {
+        size 2 0.05 0.3
+      }
+    }
+  ]
+  name "wall_2"
+  boundingObject Box {
+    size 2 0.05 0.3
+  }
+}
+Solid {
+  translation 0 2 0.15
+  children [
+    Shape {
+      appearance PBRAppearance {
+        baseColor 0.7 0.4 0.2
+        roughness 1
+      }
+      geometry Box {
+        size 1.5 0.05 0.3
+      }
+    }
+  ]
+  name "wall_3"
+  boundingObject Box {
+    size 1.5 0.05 0.3
+  }
+}
+Robot {
+  translation 1.372590576184911 -1.8095122946635225e-15 0.03987381659195437
+  rotation 4.1906666395047927e-16 -1 1.9766372517165635e-15 0.10079616867373846
+  children [
+    Shape {
+      appearance PBRAppearance {
+        baseColor 0.2 0.5 0.8
+        roughness 0.5
+      }
+      geometry Box {
+        size 0.2 0.14 0.06
+      }
+    }
+    Pose {
+      translation 0.08 0 0.031
+      children [
+        Shape {
+          appearance PBRAppearance {
+            baseColor 1 0.9 0
+          }
+          geometry Box {
+            size 0.03 0.03 0.005
+          }
+        }
+      ]
+    }
+    Lidar {
+      translation 0 0 0.04
+      horizontalResolution 360
+      fieldOfView 6.283185
+      numberOfLayers 1
+      maxRange 5
+    }
+    Camera {
+      translation 0.1 0 0.02
+      fieldOfView 1.047
+      width 128
+    }
+    Receiver {
+      channel 1
+    }
+    HingeJoint {
+      jointParameters HingeJointParameters {
+        position 73.75189153183354
+        axis 0 1 0
+        anchor 0 0.08 0
+      }
+      device [
+        RotationalMotor {
+          name "left wheel motor"
+        }
+        PositionSensor {
+          name "left wheel sensor"
+        }
+      ]
+      endPoint Solid {
+        translation 0 0.08 0
+        rotation -1.244322026888112e-16 -1 9.3262206269747e-17 1.6463321543215144
+        children [
+          Shape {
+            appearance PBRAppearance {
+              baseColor 0.1 0.1 0.1
+            }
+            geometry Cylinder {
+              height 0.02
+              radius 0.04
+            }
+          }
+        ]
+        name "left wheel"
+        boundingObject Cylinder {
+          height 0.02
+          radius 0.04
+        }
+        physics Physics {
+          density -1
+          mass 0.05
+        }
+        linearVelocity -0.03397183600106214 -1.6909012441757014e-16 0.16071319029465636
+        angularVelocity 1.2532514139103775e-15 1.3730968067885296 -2.2955003966497324e-15
+      }
+    }
+    HingeJoint {
+      jointParameters HingeJointParameters {
+        position 73.75189153183351
+        axis 0 1 0
+        anchor 0 -0.08 0
+      }
+      device [
+        RotationalMotor {
+          name "right wheel motor"
+        }
+        PositionSensor {
+          name "right wheel sensor"
+        }
+      ]
+      endPoint Solid {
+        translation 0 -0.08 0
+        rotation -2.7012700014927996e-16 -1 -2.1893771963158619e-16 1.6463321543215244
+        children [
+          Shape {
+            appearance PBRAppearance {
+              baseColor 0.1 0.1 0.1
+            }
+            geometry Cylinder {
+              height 0.02
+              radius 0.04
+            }
+          }
+        ]
+        name "right wheel"
+        boundingObject Cylinder {
+          height 0.02
+          radius 0.04
+        }
+        physics Physics {
+          density -1
+          mass 0.05
+        }
+        linearVelocity -0.03397183600106247 -3.349156929727115e-16 0.16071319029465567
+        angularVelocity -3.548462002303356e-15 1.3730968067883649 -6.927559695890868e-15
+      }
+    }
+  ]
+  name "scout"
+  boundingObject Box {
+    size 0.2 0.14 0.06
+  }
+  physics Physics {
+    density -1
+    mass 0.5
+  }
+  controller "robot_controller"
+  linearVelocity -0.03401976865597219 -1.45607357292521e-16 0.16066579053097918
+  angularVelocity -9.412107068670321e-17 -1.626899642263104 4.248411012480131e-15
+}
+Robot {
+  translation 3 -2 0.05
+  children [
+    Shape {
+      appearance PBRAppearance {
+        baseColor 1 0.2 0.2
+        emissiveColor 0.5 0 0
+      }
+      geometry Box {
+        size 0.15 0.15 0.1
+      }
+    }
+    Emitter {
+      channel 1
+    }
+  ]
+  name "pinger"
+  controller "pinger_controller"
+}
