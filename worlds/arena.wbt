@@ -117,6 +117,8 @@ Robot {
     Emitter {
       channel 1
     }
+    GPS {
+    }
   ]
   name "pinger"
   controller "pinger_controller"

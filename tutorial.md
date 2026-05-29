@@ -45,4 +45,3 @@ The camera is enabled but unused for now — that just keeps the feed warm so we
 - `CRUISE_SPEED` / `TURN_SPEED` — how fast it moves / spins (motor `maxVelocity` is 10 in the world file, so don't exceed that).
 - `PING_INTERVAL` in `pinger_controller.py` — ping cadence.
 - Pinger location — `translation 3 -2 0.05` in the world file; move it anywhere on the floor.
-
