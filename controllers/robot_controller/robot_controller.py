@@ -1,11 +1,12 @@
 """
 scout — Wavefront gradient planner with probabilistic occupancy grid.
 
-1. Occupancy grid: each cell tracks hits/visits → occupancy %.
-2. Cell cost: 1–9 for 0–90% occupancy, 1000 for >90%.
-3. Inflation: only from cells with >30% certainty.
-4. Cost matrix: Dijkstra flood-fill from goal using cell costs.
-5. Robot follows the gradient (direction vector to target cell).
+Two matrices:
+  • Matrix 1 — occupancy grid: each cell tracks hits/visits → wall or free.
+  • Matrix 2 — cost matrix: Dijkstra flood-fill from the goal over Matrix 1.
+
+The cost matrix is recomputed ONLY when a cell changes state (free ↔ wall),
+never every step. The robot follows the cost gradient toward the goal.
 """
 from controller import Robot
 import math
@@ -14,20 +15,18 @@ import heapq
 # ─── Tuning knobs ──────────────────────────────────────────────────
 TIME_STEP       = 32
 CRUISE_SPEED    = 3.0
-TURN_SPEED      = 2.0
 MAX_SPEED       = 6.28
 SAFE_DISTANCE   = 0.15
-FRONT_ARC_DEG   = 60
 
 # ─── Map / grid parameters ─────────────────────────────────────────
 MAP_SIZE        = 200
 MAP_CENTRE      = MAP_SIZE // 2
 WORLD_X_MAX     = 4.0
 WORLD_Y_MAX     = 3.0
-OBSTACLE_INFLATE = 2        # pixels of inflation around certain walls
+OBSTACLE_INFLATE = 2        # pixels of inflation around walls
 
 # ─── Occupancy thresholds ──────────────────────────────────────────
-WALL_CERTAINTY  = 0.30      # only inflate cells above this occupancy
+WALL_CERTAINTY  = 0.30      # occupancy above this counts as a wall
 IMPASSABLE      = 0.90      # above this → cost = 1000
 IMPASSABLE_COST = 1000
 
@@ -35,6 +34,10 @@ IMPASSABLE_COST = 1000
 PINGER_X        =  3.0
 PINGER_Y        = -2.0
 GOAL_TOL        = 0.10
+
+# ─── Display ───────────────────────────────────────────────────────
+DRAW_INTERVAL   = 16        # refresh the moving robot dot every N steps
+                            # (the grid itself is redrawn immediately on a replan)
 
 # ─── Neighbor definitions ─────────────────────────────────────────
 STRAIGHT = 1.0
@@ -59,6 +62,7 @@ right_motor.setVelocity(0.0)
 lidar    = robot.getDevice("lidar")
 lidar.enable(TIME_STEP)
 lidar.enablePointCloud()
+LIDAR_FOV = lidar.getFov()   # Webots scanline: index 0 at +FOV/2, angle decreases (CW) with index
 
 camera   = robot.getDevice("camera")
 camera.enable(TIME_STEP)
@@ -90,19 +94,30 @@ def pix_to_world(px, py):
     return wx, wy
 
 
+def beam_angle(i, n):
+    """Robot-relative angle of LiDAR beam i (rad, CCW+, 0 = straight ahead).
+    Webots range image: index 0 is at +FOV/2, angle decreases as index grows."""
+    return (LIDAR_FOV / 2.0) - (LIDAR_FOV * i / n)
+
+
 # ═══════════════════════════════════════════════════════════════════
-#  Occupancy grid — hits / visits → probability
+#  MATRIX 1 — occupancy grid (hits / visits → probability)
 # ═══════════════════════════════════════════════════════════════════
 hits   = [[0] * MAP_SIZE for _ in range(MAP_SIZE)]
 visits = [[0] * MAP_SIZE for _ in range(MAP_SIZE)]
 
 
 def get_occupancy(x, y):
-    """Return occupancy probability 0.0–1.0 for cell (x, y)."""
+    """Occupancy probability 0.0–1.0 for cell (x, y)."""
     v = visits[y][x]
     if v == 0:
         return 0.0
     return hits[y][x] / v
+
+
+def is_wall(x, y):
+    """Discrete cell state: True if this cell is a wall."""
+    return get_occupancy(x, y) > WALL_CERTAINTY
 
 
 def get_cell_cost(x, y):
@@ -110,7 +125,6 @@ def get_cell_cost(x, y):
     occ = get_occupancy(x, y)
     if occ > IMPASSABLE:
         return IMPASSABLE_COST
-    # Linear: 0% → 1, 90% → 9
     return 1 + int(occ / IMPASSABLE * 8)
 
 
@@ -118,7 +132,6 @@ def get_cell_cost(x, y):
 #  Bresenham line — trace a ray through the grid
 # ═══════════════════════════════════════════════════════════════════
 def bresenham(x0, y0, x1, y1):
-    """Yield all (x, y) cells along the line from (x0,y0) to (x1,y1)."""
     dx = abs(x1 - x0)
     dy = abs(y1 - y0)
     sx = 1 if x0 < x1 else -1
@@ -138,12 +151,10 @@ def bresenham(x0, y0, x1, y1):
 
 
 # ═══════════════════════════════════════════════════════════════════
-#  LiDAR scan → update occupancy grid
+#  LiDAR scan → update Matrix 1.  Returns True if any cell changed STATE.
 # ═══════════════════════════════════════════════════════════════════
 def scan_lidar(robot_x, robot_y, heading, ranges):
-    """Ray-trace each LiDAR beam. Free cells get a visit, hit cells get a hit+visit.
-    Returns True if any cell changed significantly."""
-    changed = False
+    state_changed = False
     n = len(ranges)
     max_range = lidar.getMaxRange() - 0.05
     rpx, rpy = world_to_pix(robot_x, robot_y)
@@ -152,53 +163,45 @@ def scan_lidar(robot_x, robot_y, heading, ranges):
         if r <= 0.0 or math.isinf(r) or math.isnan(r):
             continue
 
-        angle = heading + (2.0 * math.pi * i / n)
+        angle = heading + beam_angle(i, n)
         is_hit = r <= max_range
 
-        # End-point of the ray (clip to max range for free rays)
         ray_len = r if is_hit else max_range
         hx = robot_x + ray_len * math.cos(angle)
         hy = robot_y + ray_len * math.sin(angle)
         epx, epy = world_to_pix(hx, hy)
 
-        # Trace the ray
-        prev_occ = get_occupancy(epx, epy) if is_hit else -1.0
+        prev_wall = is_wall(epx, epy) if is_hit else False
         for cx, cy in bresenham(rpx, rpy, epx, epy):
             if not (0 <= cx < MAP_SIZE and 0 <= cy < MAP_SIZE):
                 continue
             if cx == epx and cy == epy and is_hit:
-                # Hit cell — mark as occupied
                 hits[cy][cx] += 1
                 visits[cy][cx] += 1
             else:
-                # Free cell — ray passed through
                 visits[cy][cx] += 1
 
-        # Check if the hit cell changed occupancy bracket significantly
-        if is_hit:
-            new_occ = get_occupancy(epx, epy)
-            if (prev_occ <= WALL_CERTAINTY) != (new_occ <= WALL_CERTAINTY):
-                changed = True
-            elif (prev_occ <= IMPASSABLE) != (new_occ <= IMPASSABLE):
-                changed = True
+        # Did the hit cell flip free → wall (or wall → free)?
+        if is_hit and is_wall(epx, epy) != prev_wall:
+            state_changed = True
 
-    return changed
+    return state_changed
 
 
 # ═══════════════════════════════════════════════════════════════════
-#  Inflation — only from cells with >30% certainty
+#  Inflation — rebuilt whenever the cost matrix is recomputed
 # ═══════════════════════════════════════════════════════════════════
 inflated = [[0] * MAP_SIZE for _ in range(MAP_SIZE)]
 
 
 def inflate_obstacles():
-    """Mark inflated zone around cells with occupancy > WALL_CERTAINTY."""
+    """Mark the inflated zone around every wall cell."""
     for y in range(MAP_SIZE):
         for x in range(MAP_SIZE):
             inflated[y][x] = 0
     for y in range(MAP_SIZE):
         for x in range(MAP_SIZE):
-            if get_occupancy(x, y) > WALL_CERTAINTY:
+            if is_wall(x, y):
                 for dy in range(-OBSTACLE_INFLATE, OBSTACLE_INFLATE + 1):
                     for dx in range(-OBSTACLE_INFLATE, OBSTACLE_INFLATE + 1):
                         ny, nx = y + dy, x + dx
@@ -207,7 +210,7 @@ def inflate_obstacles():
 
 
 # ═══════════════════════════════════════════════════════════════════
-#  Cost matrix — Dijkstra flood-fill from goal using cell costs
+#  MATRIX 2 — cost matrix: Dijkstra flood-fill from the goal
 # ═══════════════════════════════════════════════════════════════════
 cost = [[INF] * MAP_SIZE for _ in range(MAP_SIZE)]
 
@@ -220,7 +223,7 @@ def compute_cost_matrix():
         for x in range(MAP_SIZE):
             cost[y][x] = INF
 
-    # If goal on inflated obstacle, find nearest free cell
+    # If goal sits on an obstacle, snap to the nearest free cell
     if inflated[gy][gx] == 1 or get_cell_cost(gx, gy) >= IMPASSABLE_COST:
         best, best_d = None, INF
         for dy in range(-15, 16):
@@ -239,7 +242,6 @@ def compute_cost_matrix():
 
     cost[gy][gx] = 0.0
     heap = [(0.0, gx, gy)]
-
     while heap:
         c, cx, cy = heapq.heappop(heap)
         if c > cost[cy][cx]:
@@ -253,11 +255,16 @@ def compute_cost_matrix():
             cc = get_cell_cost(nx, ny)
             if cc >= IMPASSABLE_COST:
                 continue
-            # Edge weight = movement distance * cell traversal cost
             nc = c + move_dist * cc
             if nc < cost[ny][nx]:
                 cost[ny][nx] = nc
                 heapq.heappush(heap, (nc, nx, ny))
+
+
+def replan():
+    """Rebuild inflation + cost matrix. Called only on a cell-state change."""
+    inflate_obstacles()
+    compute_cost_matrix()
 
 
 # ═══════════════════════════════════════════════════════════════════
@@ -276,8 +283,7 @@ def follow_gradient(rpx, rpy):
             if 0 <= nx < MAP_SIZE and 0 <= ny < MAP_SIZE:
                 if cost[ny][nx] < best_c:
                     best_c = cost[ny][nx]
-                    best_nx = nx
-                    best_ny = ny
+                    best_nx, best_ny = nx, ny
         if (best_nx, best_ny) == (cx, cy):
             break
         cx, cy = best_nx, best_ny
@@ -309,23 +315,27 @@ def steer_to(robot_x, robot_y, heading, target_wx, target_wy):
 
 
 # ═══════════════════════════════════════════════════════════════════
-#  LiDAR helpers
+#  LiDAR sectors
 # ═══════════════════════════════════════════════════════════════════
 def lidar_sectors(ranges):
-    """Return (front_min, left_min, right_min) distances from the LiDAR.
-    Front = ±30°, Left = 60°–120°, Right = 240°–300°."""
+    """Return (front, left, right) min distances. Robot-relative angles."""
     n = len(ranges)
-    def sector_min(start_deg, end_deg):
-        i0 = int(start_deg / 360.0 * n) % n
-        i1 = int(end_deg / 360.0 * n) % n
-        if i0 <= i1:
-            vals = [r for r in ranges[i0:i1] if r > 0.0]
-        else:
-            vals = [r for r in (list(ranges[i0:]) + list(ranges[:i1])) if r > 0.0]
-        return min(vals) if vals else INF
-    front = sector_min(330, 30)
-    left  = sector_min(60, 120)
-    right = sector_min(240, 300)
+    front_vals, left_vals, right_vals = [], [], []
+    for i, r in enumerate(ranges):
+        if r <= 0.0 or math.isinf(r) or math.isnan(r):
+            continue
+        deg = math.degrees(beam_angle(i, n))
+        while deg > 180.0:  deg -= 360.0
+        while deg <= -180.0: deg += 360.0
+        if -30.0 <= deg <= 30.0:
+            front_vals.append(r)
+        elif 60.0 <= deg <= 120.0:
+            left_vals.append(r)
+        elif -120.0 <= deg <= -60.0:
+            right_vals.append(r)
+    front = min(front_vals) if front_vals else INF
+    left  = min(left_vals)  if left_vals  else INF
+    right = min(right_vals) if right_vals else INF
     return front, left, right
 
 
@@ -334,150 +344,98 @@ def lidar_sectors(ranges):
 # ═══════════════════════════════════════════════════════════════════
 def draw_map(robot_px, robot_py, goal_px, goal_py,
              target_px=None, target_py=None):
-    # Background
     display.setColor(0xDDDDDD)
     display.fillRectangle(0, 0, MAP_SIZE, MAP_SIZE)
 
-    # Occupancy grid — colour by occupancy %
     for y in range(MAP_SIZE):
         for x in range(MAP_SIZE):
             occ = get_occupancy(x, y)
-            v = visits[y][x]
-            if v == 0:
-                continue  # unseen → leave grey
             if occ > IMPASSABLE:
-                display.setColor(0x000000)       # black = wall
+                display.setColor(0x000000)                 # solid wall
             elif occ > WALL_CERTAINTY:
-                # Orange–red for uncertain walls (30–90%)
                 t = (occ - WALL_CERTAINTY) / (IMPASSABLE - WALL_CERTAINTY)
-                r = int(180 + 75 * t)
-                g = int(120 * (1.0 - t))
-                display.setColor((r << 16) | (g << 8))
-            else:
-                # Green = free (seen, low occupancy)
+                display.setColor((int(180 + 75 * t) << 16) | (int(120 * (1.0 - t)) << 8))
+            elif inflated[y][x] == 1:
+                display.setColor(0x444444)                 # inflated buffer
+            elif visits[y][x] > 0:
                 g = int(180 + 60 * (1.0 - occ / WALL_CERTAINTY))
                 display.setColor((40 << 16) | (g << 8) | 40)
+            else:
+                continue                                   # unseen → grey bg
             display.drawPixel(x, y)
 
-    # Inflated zone — dark grey overlay
-    display.setColor(0x444444)
-    for y in range(MAP_SIZE):
-        for x in range(MAP_SIZE):
-            if inflated[y][x] == 1 and get_occupancy(x, y) <= WALL_CERTAINTY:
-                display.drawPixel(x, y)
-
-    # Direction vector — cyan line
     if target_px is not None and target_py is not None:
         display.setColor(0x00FFFF)
         display.drawLine(robot_px, robot_py, target_px, target_py)
         display.setColor(0xFFFF00)
         display.fillOval(target_px, target_py, 2, 2)
 
-    # Goal — red
     display.setColor(0xFF0000)
     display.fillOval(goal_px, goal_py, 3, 3)
-
-    # Robot — blue
     display.setColor(0x0000FF)
     display.fillOval(robot_px, robot_py, 3, 3)
 
 
 # ═══════════════════════════════════════════════════════════════════
-#  Drain pings
+#  Initial cost matrix — no walls yet, pure gradient
 # ═══════════════════════════════════════════════════════════════════
-def drain_pings():
-    while receiver.getQueueLength() > 0:
-        try:
-            msg = receiver.getString()
-        except Exception:
-            msg = receiver.getBytes()
-        strength  = receiver.getSignalStrength()
-        direction = receiver.getEmitterDirection()
-        print(f"[scout] PING '{msg}'  "
-              f"strength={strength:.4f}  "
-              f"dir=({direction[0]:+.2f}, {direction[1]:+.2f}, {direction[2]:+.2f})")
-        receiver.nextPacket()
-
-
-# ═══════════════════════════════════════════════════════════════════
-#  Initial cost matrix — no walls, pure gradient
-# ═══════════════════════════════════════════════════════════════════
-print("[scout] Computing initial cost matrix ...")
 compute_cost_matrix()
-print("[scout] Done. Following gradient toward pinger.")
 
 # ═══════════════════════════════════════════════════════════════════
 #  Main loop
 # ═══════════════════════════════════════════════════════════════════
-step_count = 0
 prev_cell  = (-1, -1)
 target_px, target_py = None, None
 target_wx, target_wy = 0.0, 0.0
+step_count = 0
 
 while robot.step(TIME_STEP) != -1:
     step_count += 1
-    drain_pings()
+    map_changed = False
 
-    # ── Pose ──────────────────────────────────────────────────────
-    vals         = gps.getValues()
-    robot_x      = vals[0]
-    robot_y      = vals[1]
+    vals    = gps.getValues()
+    robot_x = vals[0]
+    robot_y = vals[1]
     compass_vals = compass.getValues()
-    # Webots compass: direction of north in robot's local frame
-    # Try all formulas and print to diagnose
-    heading      = math.atan2(compass_vals[0], compass_vals[1])
-
-    if step_count <= 3:
-        print(f"[DEBUG] compass raw=({compass_vals[0]:.3f}, {compass_vals[1]:.3f}, {compass_vals[2]:.3f})  "
-              f"heading={math.degrees(heading):.1f}°  "
-              f"GPS=({robot_x:.2f}, {robot_y:.2f})")
+    heading = math.atan2(compass_vals[0], compass_vals[1])
 
     robot_px, robot_py = world_to_pix(robot_x, robot_y)
     goal_px, goal_py   = world_to_pix(PINGER_X, PINGER_Y)
     current_cell = (robot_px, robot_py)
 
-    # ── Only process when entering a new cell ─────────────────────
+    # Process the map only when entering a new cell
     if current_cell != prev_cell:
         prev_cell = current_cell
-
         ranges = lidar.getRangeImage()
-        if ranges:
-            changed = scan_lidar(robot_x, robot_y, heading, ranges)
-            if changed:
-                inflate_obstacles()
-                compute_cost_matrix()
-                print(f"[scout] Occupancy changed → cost matrix updated")
-
-        # Recompute steering target
+        if ranges and scan_lidar(robot_x, robot_y, heading, ranges):
+            replan()                # only when a cell flipped state
+            map_changed = True
         tpx, tpy = follow_gradient(robot_px, robot_py)
         target_px, target_py = tpx, tpy
         target_wx, target_wy = pix_to_world(tpx, tpy)
 
-    # ── Reached the goal? ─────────────────────────────────────────
+    # Reached the goal?
     dist_to_goal = math.hypot(PINGER_X - robot_x, PINGER_Y - robot_y)
     if dist_to_goal < GOAL_TOL:
-        print("[scout] ★ Reached the pinger! ★")
         left_motor.setVelocity(0.0)
         right_motor.setVelocity(0.0)
-        draw_map(robot_px, robot_py, goal_px, goal_py)
+        if map_changed or step_count % DRAW_INTERVAL == 0:
+            draw_map(robot_px, robot_py, goal_px, goal_py)
         continue
 
-    # ── Drive ──────────────────────────────────────────────────────
+    # Drive
     ranges = lidar.getRangeImage()
-    front_d, left_d, right_d = (INF, INF, INF)
+    front_d = INF
     if ranges:
-        front_d, left_d, right_d = lidar_sectors(ranges)
+        front_d, _, _ = lidar_sectors(ranges)
 
     if front_d < SAFE_DISTANCE and ranges:
-        # Wall ahead! Force scan + recompute so gradient routes around it
-        scan_lidar(robot_x, robot_y, heading, ranges)
-        inflate_obstacles()
-        compute_cost_matrix()
-        # Get new target from updated gradient
+        if scan_lidar(robot_x, robot_y, heading, ranges):
+            replan()
+            map_changed = True
         tpx, tpy = follow_gradient(robot_px, robot_py)
         target_px, target_py = tpx, tpy
         target_wx, target_wy = pix_to_world(tpx, tpy)
-        print(f"[scout] Wall ahead ({front_d:.2f}m) → forced recompute")
 
     if target_px is not None:
         lv, rv = steer_to(robot_x, robot_y, heading, target_wx, target_wy)
@@ -487,11 +445,6 @@ while robot.step(TIME_STEP) != -1:
         left_motor.setVelocity(CRUISE_SPEED)
         right_motor.setVelocity(CRUISE_SPEED)
 
-    # ── Draw ──────────────────────────────────────────────────────
-    draw_map(robot_px, robot_py, goal_px, goal_py, target_px, target_py)
-
-    if step_count % 50 == 0:
-        print(f"GPS: {robot_x:.2f}, {robot_y:.2f}  "
-              f"Heading: {math.degrees(heading):.1f}°  "
-              f"Goal dist: {dist_to_goal:.2f} m  "
-              f"Front: {front_d:.2f} L: {left_d:.2f} R: {right_d:.2f}")
+    # Repaint when the map changed, otherwise just periodically for the robot dot
+    if map_changed or step_count % DRAW_INTERVAL == 0:
+        draw_map(robot_px, robot_py, goal_px, goal_py, target_px, target_py)
