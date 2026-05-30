@@ -76,7 +76,7 @@ E-puck {
   translation 0 0 0
   rotation 0 0 1 0
   name "scout"
-  controller "robot_controller"
+  controller "robot_controller_radio"
   receiver_channel 1
   camera_fieldOfView 1.047
   camera_width 128
@@ -91,8 +91,8 @@ E-puck {
     }
     Display {
       name "map_display"
-      width 200
-      height 200
+      width 400
+      height 400
     }
     GPS {
       name "gps"
@@ -107,8 +107,10 @@ Robot {
   children [
     Shape {
       appearance PBRAppearance {
-        baseColor 1 0.2 0.2
-        emissiveColor 0.5 0 0
+        baseColor 1 0 0
+        emissiveColor 1 0 0
+        roughness 0.2
+        metalness 0
       }
       geometry Box {
         size 0.15 0.15 0.1
@@ -117,9 +119,7 @@ Robot {
     Emitter {
       channel 1
     }
-    GPS {
-    }
   ]
   name "pinger"
-  controller "pinger_controller"
+  controller "signal_controller_radio"
 }

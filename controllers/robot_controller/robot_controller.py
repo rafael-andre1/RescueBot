@@ -4,24 +4,28 @@ scout — distress-ping rescue robot.
 Behaviour:
   1. Spiral search — wander outward in an expanding spiral, reactively
      avoiding obstacles, until a distress ping is received.
-  2. On ping — read the source position broadcast inside the ping and lock in
-     the homing target. Navigation does NOT use the map / cost matrix.
-  3. Home in — drive in a straight line toward the source, deflecting around
-     obstacles via LiDAR.
+  2. On ping — SOS carries no coordinates; engage gradient navigation toward
+     the hardcoded goal using the live cost matrix.
+  3. Home in — follow the Dijkstra gradient (10-cell lookahead), deflecting
+     around obstacles via LiDAR.
 
-A probabilistic occupancy grid (hits / visits → wall or free) is still built
-the whole time as a SLAM map. The Dijkstra cost-matrix / gradient helpers are
-retained but are no longer used for navigation.
+A probabilistic occupancy grid (hits / visits → wall or free) is built the
+whole time. When a cell changes state the cost matrix is replanned so the
+gradient always reflects the current known map.
+
+Time limit: SIM_TIME_LIMIT seconds. On arrival or expiry the occupancy grid
+is saved as slam_map.png.
 """
 from controller import Robot
 import math
 import heapq
 
-#  Tuning knobs 
-TIME_STEP       = 32
-CRUISE_SPEED    = 3.0
-MAX_SPEED       = 6.28
-SAFE_DISTANCE   = 0.15
+#  Tuning knobs
+TIME_STEP        = 32
+CRUISE_SPEED     = 3.0
+MAX_SPEED        = 6.28
+SAFE_DISTANCE    = 0.15
+SIM_TIME_LIMIT   = 105.0        # 1 min 45 s
 
 #  Map / grid parameters 
 MAP_SIZE        = 200
@@ -351,6 +355,42 @@ def lidar_sectors(ranges):
 # ═══════════════════════════════════════════════════════════════════
 #  Display
 # ═══════════════════════════════════════════════════════════════════
+# ═══════════════════════════════════════════════════════════════════
+#  Image save — writes slam_map.png next to this script
+# ═══════════════════════════════════════════════════════════════════
+def save_map_image(filename="slam_map.png"):
+    try:
+        from PIL import Image
+        img = Image.new("RGB", (MAP_SIZE, MAP_SIZE), (221, 221, 221))
+        pix = img.load()
+        for y in range(MAP_SIZE):
+            for x in range(MAP_SIZE):
+                occ = get_occupancy(x, y)
+                if occ > IMPASSABLE:
+                    pix[x, y] = (0, 0, 0)
+                elif occ > WALL_CERTAINTY:
+                    t = (occ - WALL_CERTAINTY) / (IMPASSABLE - WALL_CERTAINTY)
+                    pix[x, y] = (int(180 + 75 * t), int(120 * (1.0 - t)), 0)
+                elif inflated[y][x] == 1:
+                    pix[x, y] = (68, 68, 68)
+                elif visits[y][x] > 0:
+                    g = int(180 + 60 * (1.0 - occ / WALL_CERTAINTY))
+                    pix[x, y] = (40, g, 40)
+        gx, gy = world_to_pix(PINGER_X, PINGER_Y)
+        for dy in range(-3, 4):
+            for dx in range(-3, 4):
+                nx, ny = gx + dx, gy + dy
+                if 0 <= nx < MAP_SIZE and 0 <= ny < MAP_SIZE:
+                    pix[nx, ny] = (255, 0, 0)
+        img.save(filename)
+        print("[scout] map saved → " + filename)
+    except ImportError:
+        print("[scout] install Pillow to enable image save:  pip install Pillow")
+
+
+# ═══════════════════════════════════════════════════════════════════
+#  Display
+# ═══════════════════════════════════════════════════════════════════
 def draw_map(robot_px, robot_py, goal_px, goal_py,
              target_px=None, target_py=None):
     display.setColor(0xDDDDDD)
@@ -393,11 +433,10 @@ compute_cost_matrix()
 # ═══════════════════════════════════════════════════════════════════
 #  Main loop
 # ═══════════════════════════════════════════════════════════════════
-prev_cell  = (-1, -1)
-target_px, target_py = None, None
-target_wx, target_wy = 0.0, 0.0
-step_count = 0
+prev_cell     = (-1, -1)
+step_count    = 0
 ping_received = False        # spiral-search until a distress ping arrives
+goal_px, goal_py = world_to_pix(PINGER_X, PINGER_Y)
 
 # Reactive-driving knobs
 AVOID_DISTANCE   = 0.22      # deflect when an obstacle is this close ahead (m)
@@ -405,16 +444,6 @@ TURN_SPEED       = 4.0       # wheel speed while pivoting away from an obstacle
 SPIRAL_OMEGA0    = 3.0       # initial turn rate of the search spiral
 SPIRAL_OMEGA_MIN = 0.4       # the spiral never opens wider than this
 SPIRAL_DECAY     = 0.004     # how fast the spiral opens up, per step
-
-
-def parse_source(msg, fallback_x, fallback_y):
-    """Extract the source coords from an 'SOS x y' distress message.
-    Falls back to the given coords if the message is malformed."""
-    parts = msg.split()
-    try:
-        return float(parts[1]), float(parts[2])
-    except (IndexError, ValueError):
-        return fallback_x, fallback_y
 
 
 def spiral_cmd(t):
@@ -439,34 +468,41 @@ def avoid_or(lv, rv, ranges):
 
 while robot.step(TIME_STEP) != -1:
     step_count += 1
+    sim_time    = step_count * TIME_STEP / 1000.0
     map_changed = False
 
-    vals    = gps.getValues()
+    vals         = gps.getValues()
     robot_x, robot_y = vals[0], vals[1]
     compass_vals = compass.getValues()
-    heading = math.atan2(compass_vals[0], compass_vals[1])
+    heading      = math.atan2(compass_vals[0], compass_vals[1])
 
     robot_px, robot_py = world_to_pix(robot_x, robot_y)
     current_cell = (robot_px, robot_py)
-    ranges = lidar.getRangeImage()
+    ranges       = lidar.getRangeImage()
 
-    # SLAM: keep building the occupancy map on every new cell, in BOTH phases.
+    # SLAM: update map and replan whenever a cell changes state.
     if current_cell != prev_cell:
         prev_cell = current_cell
         if ranges and scan_lidar(robot_x, robot_y, heading, ranges):
-            inflate_obstacles()     # refresh the inflated buffer for the map view
+            replan()            # inflate + recompute cost matrix
             map_changed = True
 
-    # Listen for the distress ping (only matters until the first one arrives).
+    # Time limit.
+    if sim_time >= SIM_TIME_LIMIT:
+        left_motor.setVelocity(0.0)
+        right_motor.setVelocity(0.0)
+        print("[scout] time limit reached (%.1f s)" % sim_time)
+        draw_map(robot_px, robot_py, goal_px, goal_py)
+        save_map_image()
+        break
+
+    # Listen for SOS — flag only, no coordinates read.
     if not ping_received:
         while receiver.getQueueLength() > 0:
             msg = receiver.getString()
             if "SOS" in msg:
                 ping_received = True
-                target_wx, target_wy = parse_source(msg, PINGER_X, PINGER_Y)
-                target_px, target_py = world_to_pix(target_wx, target_wy)
-                print("[scout] distress ping received - homing to "
-                      "(%.2f, %.2f)" % (target_wx, target_wy))
+                print("[scout] SOS received — switching to gradient navigation")
             receiver.nextPacket()
 
     # Phase 1: no ping yet -> spiral outward, mapping as we go.
@@ -476,23 +512,24 @@ while robot.step(TIME_STEP) != -1:
         left_motor.setVelocity(lv)
         right_motor.setVelocity(rv)
         if map_changed or step_count % DRAW_INTERVAL == 0:
-            gpx, gpy = world_to_pix(PINGER_X, PINGER_Y)
-            draw_map(robot_px, robot_py, gpx, gpy)
+            draw_map(robot_px, robot_py, goal_px, goal_py)
         continue
 
-    # Phase 2: ping received -> straight line to the received source position.
-    goal_px, goal_py = world_to_pix(target_wx, target_wy)
-    if math.hypot(target_wx - robot_x, target_wy - robot_y) < GOAL_TOL:
+    # Phase 2: gradient descent to goal.
+    if math.hypot(PINGER_X - robot_x, PINGER_Y - robot_y) < GOAL_TOL:
         left_motor.setVelocity(0.0)
         right_motor.setVelocity(0.0)
-        if map_changed or step_count % DRAW_INTERVAL == 0:
-            draw_map(robot_px, robot_py, goal_px, goal_py, target_px, target_py)
-        continue
+        print("[scout] goal reached in %.1f s" % sim_time)
+        draw_map(robot_px, robot_py, goal_px, goal_py)
+        save_map_image()
+        break
 
-    lv, rv = steer_to(robot_x, robot_y, heading, target_wx, target_wy)
+    lookahead_px, lookahead_py = follow_gradient(robot_px, robot_py)
+    lookahead_wx, lookahead_wy = pix_to_world(lookahead_px, lookahead_py)
+    lv, rv = steer_to(robot_x, robot_y, heading, lookahead_wx, lookahead_wy)
     lv, rv = avoid_or(lv, rv, ranges)
     left_motor.setVelocity(lv)
     right_motor.setVelocity(rv)
 
     if map_changed or step_count % DRAW_INTERVAL == 0:
-        draw_map(robot_px, robot_py, goal_px, goal_py, target_px, target_py)
+        draw_map(robot_px, robot_py, goal_px, goal_py, lookahead_px, lookahead_py)
