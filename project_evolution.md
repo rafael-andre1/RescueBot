@@ -345,7 +345,9 @@ Once within `CAMERA_DIST`, `scan_for_red()` runs every step and a half-scale pre
 
  1. Not tested for when 2 pings are coming from the same space (robot collision and mutual harm)
  2. Each robot is only mapped to one channel (maybe after a robot reaches its destination it can try and chase another ping, the one it's closest to, and lock in on that channel after a channel sweep)
- 3. Efficiency issues might happen: no Dijkstra or mechanism to avoid local minima
+ 3. Efficiency issues might happen: no Dijkstra or mechanism to avoid local minima, might get stuck in endless loop of wrong positions and directions due to lack of memory, no way to get optimal path planning for rescue team to reach pings
+ 4. Each channel is being associated to a color automatically: that color must be randomly assigned to pings and the robot must only aquire that color for the plot once it reaches the military team and outputs the map
+    1. maybe not a bad idea to have more than 3 colors, and then give a list of urgency based on the most ammount of red in the camera vision
 
 
 # How to Run
