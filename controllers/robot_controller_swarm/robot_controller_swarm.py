@@ -48,8 +48,8 @@ CRUISE_SPEED     = 3.0
 MAX_SPEED        = 6.28
 SIM_TIME_LIMIT   = 180.0
 
-RADIO_STOP_DIST  = 0.35    # legacy proximity fallback (unused as arrival)
-CAMERA_DIST      = 1.50    # scan the camera within this estimated range
+RADIO_STOP_DIST  = 0.80    # stop only once radio range is under this AND colour seen
+CAMERA_DIST      = 1.15    # start scanning the camera within this range
 
 MAP_SIZE         = 400
 MAP_CENTRE       = MAP_SIZE // 2
@@ -450,7 +450,7 @@ def navigate(ranges, ping_bearing):
 #  Display
 # ═══════════════════════════════════════════════════════════════════
 def draw_map(robot_px, robot_py, trajectory,
-             pinger_pix=None, show_camera=False):
+             pinger_pix=None, show_camera=False, stop_pix=None):
     display.setColor(0xDDDDDD)
     display.fillRectangle(0, 0, MAP_SIZE, MAP_SIZE)
 
@@ -482,9 +482,18 @@ def draw_map(robot_px, robot_py, trajectory,
     display.drawLine(MAP_CENTRE - 5, MAP_CENTRE, MAP_CENTRE + 5, MAP_CENTRE)
     display.drawLine(MAP_CENTRE, MAP_CENTRE - 5, MAP_CENTRE, MAP_CENTRE + 5)
 
+    # Estimated beacon — red square + dashed link from the stop point.
     if pinger_pix is not None:
+        if stop_pix is not None:
+            display.setColor(0xFF8888)
+            display.drawLine(stop_pix[0], stop_pix[1], pinger_pix[0], pinger_pix[1])
         display.setColor(0xFF0000)
         display.fillRectangle(pinger_pix[0] - 4, pinger_pix[1] - 4, 8, 8)
+
+    # Stop point (where the robot actually halted) — yellow ring.
+    if stop_pix is not None:
+        display.setColor(0xFFFF00)
+        display.drawOval(stop_pix[0], stop_pix[1], 5, 5)
 
     display.setColor(0x0000FF)
     display.fillOval(robot_px, robot_py, 3, 3)
@@ -581,7 +590,8 @@ def save_map_image(robot_maps, filename, ref_start):
         sx, sy = rm["start_pos"]
         sx_r, sy_r = sx - rsx, sy - rsy
         traj = rm.get("trajectory", [])           # local coords (start = 0,0)
-        ppos = rm.get("pinger_pos", None)         # local coords
+        ppos = rm.get("pinger_pos", None)         # local coords — estimated beacon
+        spos = rm.get("stop_pos",   None)         # local coords — robot halt
 
         if len(traj) > 1:
             tx = [p[0] + sx_r for p in traj]
@@ -597,13 +607,31 @@ def save_map_image(robot_maps, filename, ref_start):
             Line2D([0], [0], marker="P", color="w", markerfacecolor=col,
                    markersize=8, label="%s start" % lbl))
 
+        # Robot's actual halt point — open circle, same colour family.
+        if spos is not None:
+            stx, sty = spos[0] + sx_r, spos[1] + sy_r
+            ax.plot(stx, sty, marker="o", markerfacecolor="none",
+                    markeredgecolor=col, markeredgewidth=1.8,
+                    markersize=11, zorder=5)
+            legend_handles.append(
+                Line2D([0], [0], marker="o", color="w",
+                       markerfacecolor="none", markeredgecolor=col,
+                       markeredgewidth=1.8, markersize=10,
+                       label="%s stop point" % lbl))
+
+        # Estimated beacon location (radio range + bearing) — filled star,
+        # joined to the stop point by a dashed line so the offset is obvious.
         if ppos is not None:
             px, py = ppos[0] + sx_r, ppos[1] + sy_r
-            ax.plot(px, py, marker="*", color=col, markersize=14, zorder=6,
-                    markeredgecolor="black", markeredgewidth=0.5)
+            if spos is not None:
+                stx, sty = spos[0] + sx_r, spos[1] + sy_r
+                ax.plot([stx, px], [sty, py], color=col,
+                        linewidth=1.0, linestyle="--", alpha=0.7, zorder=4)
+            ax.plot(px, py, marker="*", color=col, markersize=15, zorder=6,
+                    markeredgecolor="black", markeredgewidth=0.6)
             legend_handles.append(
                 Line2D([0], [0], marker="*", color="w", markerfacecolor=col,
-                       markersize=10, label="%s person found" % lbl))
+                       markersize=11, label="%s beacon (radio est.)" % lbl))
 
     # Legend lives in its own column to the right of the map.
     ax.legend(handles=legend_handles, bbox_to_anchor=(1.02, 1.0),
@@ -618,7 +646,7 @@ def save_map_image(robot_maps, filename, ref_start):
 # ═══════════════════════════════════════════════════════════════════
 #  Shared-state I/O — pickle-based handoff between scouts
 # ═══════════════════════════════════════════════════════════════════
-def write_own_state(pinger_local, trajectory, find_time):
+def write_own_state(pinger_local, stop_local, trajectory, find_time):
     state = {
         "id":         ROBOT_ID,
         "label":      LABEL,
@@ -627,7 +655,8 @@ def write_own_state(pinger_local, trajectory, find_time):
         "hits":       hits,
         "visits":     visits,
         "trajectory": list(trajectory),     # LOCAL coords (start = 0,0)
-        "pinger_pos": pinger_local,         # LOCAL coords (start = 0,0)
+        "pinger_pos": pinger_local,         # LOCAL coords — estimated beacon position
+        "stop_pos":   stop_local,           # LOCAL coords — where the robot actually halted
         "find_time":  find_time,            # sim seconds since this scout started
         "wall_time":  time.time(),          # for cross-scout ordering
     }
@@ -652,11 +681,11 @@ def load_all_states():
     return out
 
 
-def emit_staged_map(pinger_local, trajectory, find_time):
+def emit_staged_map(pinger_local, stop_local, trajectory, find_time):
     """Write our state, then load every state on disk and render the
     combined map for the current stage (= number of scouts arrived).
     The first finder's start translation defines the merged frame."""
-    write_own_state(pinger_local, trajectory, find_time)
+    write_own_state(pinger_local, stop_local, trajectory, find_time)
     states = load_all_states()
     if not states:
         return
@@ -781,10 +810,11 @@ while robot.step(TIME_STEP) != -1:
             draw_map(robot_px, robot_py, trajectory)
         continue
 
-    # ── Phase 2: potential-field homing; arrival = camera colour ID ──
+    # ── Phase 2: potential-field homing; arrival = proximity + colour ──
 
-    # Camera scan: arrival trigger. As soon as the target colour is
-    # identified, stop and emit the staged map — no proximity wait.
+    # Camera scan: confirms that the target colour is in view. Just sets
+    # person_found — the actual stop is gated on proximity below so the
+    # beacon stays centred and a comfortable distance away.
     if last_range < CAMERA_DIST:
         if not camera_active:
             camera_active = True
@@ -797,17 +827,31 @@ while robot.step(TIME_STEP) != -1:
                       % (ROBOT_ID, count, TARGET_COL, TARGET_PIXEL_MIN))
             if found:
                 person_found = True
-                print("[scout %s] FOUND %s PERSON — colour ID at est. %.2f m, %.1f s"
+                print("[scout %s] colour ID — %s confirmed at est. %.2f m, %.1f s"
                       % (ROBOT_ID, TARGET_COL.upper(), last_range, sim_time))
-                left_motor.setVelocity(0.0)
-                right_motor.setVelocity(0.0)
-                pinger_pix   = (robot_px, robot_py)
-                pinger_local = (local_x, local_y)
-                draw_map(robot_px, robot_py, trajectory, pinger_pix, camera_active)
-                reached = True
-                emit_staged_map(pinger_local, trajectory, sim_time)
-                emit_staged_map._last_stage = len(load_all_states())
-                continue
+
+    # Arrival: BOTH proximity under RADIO_STOP_DIST AND colour confirmed.
+    if person_found and last_range < RADIO_STOP_DIST:
+        left_motor.setVelocity(0.0)
+        right_motor.setVelocity(0.0)
+        stop_local = (local_x, local_y)
+        ping_world_angle = heading + last_bearing
+        pinger_local = (
+            local_x + last_range * math.cos(ping_world_angle),
+            local_y + last_range * math.sin(ping_world_angle),
+        )
+        pinger_pix = world_to_pix(*pinger_local)
+        stop_pix   = (robot_px, robot_py)
+        print("[scout %s] arrival — stop=(%.2f, %.2f) ping≈(%.2f, %.2f) "
+              "Δ=%.2f m at %.1f s"
+              % (ROBOT_ID, stop_local[0], stop_local[1],
+                 pinger_local[0], pinger_local[1], last_range, sim_time))
+        draw_map(robot_px, robot_py, trajectory, pinger_pix, camera_active,
+                 stop_pix=stop_pix)
+        reached = True
+        emit_staged_map(pinger_local, stop_local, trajectory, sim_time)
+        emit_staged_map._last_stage = len(load_all_states())
+        continue
 
     # Motion: potential-field navigator. Ping bearing attracts, close
     # lidar beams repel — smooth deflection, no committed wall side.
