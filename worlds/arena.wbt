@@ -76,7 +76,7 @@ E-puck {
   translation 0 0 0
   rotation 0 0 1 0
   name "scout"
-  controller "robot_controller_radio"
+  controller "robot_controller"
   receiver_channel 1
   camera_fieldOfView 1.047
   camera_width 128
@@ -117,9 +117,11 @@ Robot {
       }
     }
     Emitter {
+      name "emitter"
       channel 1
     }
   ]
   name "pinger"
-  controller "signal_controller_radio"
+  controller "signal_controller"
+  supervisor TRUE
 }

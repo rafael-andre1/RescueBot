@@ -24,7 +24,8 @@ import heapq
 TIME_STEP        = 32
 CRUISE_SPEED     = 3.0
 MAX_SPEED        = 6.28
-SIM_TIME_LIMIT   = 105.0        # 1 min 45 s
+SAFE_DISTANCE    = 0.12         # reactive override kicks in if lidar in the
+                                # intended direction reads closer than this (m)
 
 #  E-puck odometry (replaces GPS)
 WHEEL_R          = 0.0205       # m, wheel radius
@@ -35,7 +36,12 @@ MAP_SIZE         = 200
 MAP_CENTRE       = MAP_SIZE // 2
 WORLD_X_MAX      = 4.0
 WORLD_Y_MAX      = 3.0
-OBSTACLE_INFLATE = 2
+OBSTACLE_INFLATE      = 4    # cells of buffer the planner adds around walls
+                             # (e-puck radius ≈ 3.5 cm, cell ≈ 3-4 cm; 4 cells
+                             # = 12-16 cm — robot physically fits any planned cell)
+ROBOT_FOOTPRINT_CELLS = 2    # half-width of robot's body footprint, in cells
+                             # (used by footprint_clear, currently dormant while
+                             # the reactive override is off)
 
 #  Occupancy thresholds
 WALL_CERTAINTY   = 0.30
@@ -44,8 +50,18 @@ IMPASSABLE_COST  = 1000
 
 #  Radio homing
 GOAL_MOVE_THRESH = 0.20         # re-plan when bearing-derived goal moves > this (m)
-S_ARRIVE         = 0.10         # signal strength threshold → declare arrival
-                                # (tune empirically: print strength when near the pinger)
+S_ARRIVE         = 6.25         # signal strength threshold → declare arrival.
+                                # Webots emitter: strength = 1/d². So:
+                                #   d = 1/sqrt(s)   →   s = 1/d²
+                                #   d = 0.40 m → s = 6.25
+                                #   d = 0.30 m → s = 11.1
+                                #   d = 0.20 m → s = 25.0
+                                # Keep this aligned with signal_controller's
+                                # RESCUE_RADIUS so scout + signal trigger at the
+                                # same distance.
+
+#  Continuous rescue
+MAX_RESCUES        = 10         # stop after this many help requests handled
 
 #  Display
 DRAW_INTERVAL    = 16
@@ -386,7 +402,7 @@ def estimate_goal_from_radio(robot_x, robot_y, heading):
     best_s, best_b = -1.0, 0.0
     while receiver.getQueueLength() > 0:
         msg = receiver.getString()
-        if "HELP" in msg:                        # pinger sends "HELP"
+        if "SOS" in msg or "HELP" in msg:        # accept either keyword
             s = receiver.getSignalStrength()
             d = receiver.getEmitterDirection()
             b = math.atan2(d[1], d[0])           # robot-relative bearing
@@ -405,24 +421,128 @@ def estimate_goal_from_radio(robot_x, robot_y, heading):
 # ═══════════════════════════════════════════════════════════════════
 #  Gradient follower — trace several cells ahead
 # ═══════════════════════════════════════════════════════════════════
-LOOK_AHEAD_CELLS = 10
+def follow_gradient(rpx, rpy, heading):
+    """Pick the next target cell from the 16-cell area around the robot.
+    The robot's footprint is ~2×2 cells, so the candidate area is 4×4 = 16
+    cells (1-cell margin around the footprint in every direction).
+    Picks the cell with the lowest cost; on ties, picks the one requiring
+    the least heading change — so a straight valley in the cost field
+    produces straight-line motion."""
+    candidates = []
+    for dy in (-1, 0, 1, 2):
+        for dx in (-1, 0, 1, 2):
+            nx, ny = rpx + dx, rpy + dy
+            if not (0 <= nx < MAP_SIZE and 0 <= ny < MAP_SIZE):
+                continue
+            candidates.append((cost[ny][nx], dx, dy, nx, ny))
+
+    if not candidates:
+        return rpx, rpy
+
+    min_c = min(c for (c, _, _, _, _) in candidates)
+    if min_c == INF:
+        return rpx, rpy              # nothing reachable, hold position
+
+    tied = [t for t in candidates if t[0] == min_c]
+    if len(tied) == 1:
+        return tied[0][3], tied[0][4]
+
+    # Tie-break: least heading change (max cos(bearing − heading)).
+    # Skip the "stay" candidate (dx=dy=0) if there's any tied move.
+    rwx, rwy = pix_to_world(rpx, rpy)
+    best = (rpx, rpy)
+    best_align = -INF
+    for _, dx, dy, nx, ny in tied:
+        if dx == 0 and dy == 0:
+            continue
+        nwx, nwy = pix_to_world(nx, ny)
+        bearing = math.atan2(nwy - rwy, nwx - rwx)
+        align = math.cos(bearing - heading)
+        if align > best_align:
+            best_align = align
+            best = (nx, ny)
+    return best
 
 
-def follow_gradient(rpx, rpy):
-    cx, cy = rpx, rpy
-    for _ in range(LOOK_AHEAD_CELLS):
-        best_c = cost[cy][cx]
-        best_nx, best_ny = cx, cy
-        for dx, dy, _ in NEIGHBOURS:
+# ═══════════════════════════════════════════════════════════════════
+#  Reactive safety override
+#  If the gradient's intended direction would push the robot below
+#  SAFE_DISTANCE of a wall (per current LiDAR), override the target by
+#  picking the lowest-cost neighbour cell that DOES have safe clearance.
+#  The override is naturally transient — it's re-evaluated every step,
+#  so the moment the intended direction is safe again the planner takes
+#  over without state.
+# ═══════════════════════════════════════════════════════════════════
+def footprint_clear(cx, cy):
+    """True if the robot's body footprint around (cx, cy) is free of walls and
+    inflated cells. The footprint is (2N+1)×(2N+1) cells with N=ROBOT_FOOTPRINT_CELLS,
+    so it captures the fact that the robot is bigger than one cell."""
+    for dy in range(-ROBOT_FOOTPRINT_CELLS, ROBOT_FOOTPRINT_CELLS + 1):
+        for dx in range(-ROBOT_FOOTPRINT_CELLS, ROBOT_FOOTPRINT_CELLS + 1):
             nx, ny = cx + dx, cy + dy
-            if 0 <= nx < MAP_SIZE and 0 <= ny < MAP_SIZE:
-                if cost[ny][nx] < best_c:
-                    best_c = cost[ny][nx]
-                    best_nx, best_ny = nx, ny
-        if (best_nx, best_ny) == (cx, cy):
-            break
-        cx, cy = best_nx, best_ny
-    return cx, cy
+            if not (0 <= nx < MAP_SIZE and 0 <= ny < MAP_SIZE):
+                return False
+            if is_wall(nx, ny) or inflated[ny][nx] == 1:
+                return False
+    return True
+
+
+def lidar_at_bearing(ranges, bearing_rel, half_window=3):
+    """Min LiDAR range in a small arc around the given robot-relative bearing."""
+    if not ranges:
+        return INF
+    n = len(ranges)
+    # beam_angle(i, n) = FOV/2 - FOV*i/n  ⇒  i = (FOV/2 - bearing) * n/FOV
+    center = int(round((LIDAR_FOV / 2.0 - bearing_rel) * n / LIDAR_FOV)) % n
+    min_r = INF
+    for offset in range(-half_window, half_window + 1):
+        r = ranges[(center + offset) % n]
+        if r > 0.0 and not math.isinf(r) and not math.isnan(r) and r < min_r:
+            min_r = r
+    return min_r
+
+
+def safe_target_override(rpx, rpy, robot_x, robot_y, heading, ranges, intended):
+    """If the intended direction is unsafe, return the lowest-cost neighbour
+    cell that has clearance > SAFE_DISTANCE. Otherwise return `intended`.
+
+    Returns (target_cell, was_overridden)."""
+    # 1) Check the intended direction first.
+    iwx, iwy = pix_to_world(*intended)
+    bearing_world = math.atan2(iwy - robot_y, iwx - robot_x)
+    bearing_rel   = bearing_world - heading
+    while bearing_rel >  math.pi: bearing_rel -= 2.0 * math.pi
+    while bearing_rel < -math.pi: bearing_rel += 2.0 * math.pi
+    intended_clear = (lidar_at_bearing(ranges, bearing_rel) >= SAFE_DISTANCE
+                      and footprint_clear(intended[0], intended[1]))
+    if intended_clear:
+        return intended, False
+
+    # 2) Intended is unsafe — pick the lowest-cost neighbour that satisfies
+    #    BOTH the LiDAR clearance check AND the footprint check (so the
+    #    robot's body actually fits there, even though it spans several cells).
+    best_c, best = INF, None
+    for dx, dy, _ in NEIGHBOURS:
+        nx, ny = rpx + dx, rpy + dy
+        if not (0 <= nx < MAP_SIZE and 0 <= ny < MAP_SIZE):
+            continue
+        c = cost[ny][nx]
+        if c == INF:
+            continue
+        if not footprint_clear(nx, ny):
+            continue
+        nwx, nwy = pix_to_world(nx, ny)
+        b_world = math.atan2(nwy - robot_y, nwx - robot_x)
+        b_rel   = b_world - heading
+        while b_rel >  math.pi: b_rel -= 2.0 * math.pi
+        while b_rel < -math.pi: b_rel += 2.0 * math.pi
+        if lidar_at_bearing(ranges, b_rel) < SAFE_DISTANCE:
+            continue
+        if c < best_c:
+            best_c, best = c, (nx, ny)
+    if best is None:
+        return intended, False   # nothing safe — fall back to plan, scout will likely stop
+    return best, True
 
 
 # ═══════════════════════════════════════════════════════════════════
@@ -520,6 +640,7 @@ goal_x, goal_y = 0.0, 0.0          # placeholder; set on first ping
 robot_x, robot_y = 0.0, 0.0        # dead-reckoned pose, map origin = start
 prev_left_enc  = None              # initialised on first iteration
 prev_right_enc = None
+rescues_completed = 0              # how many help requests handled so far
 
 print("[scout] online — sitting still until first HELP ping")
 
@@ -562,38 +683,41 @@ while robot.step(TIME_STEP) != -1:
             map_changed = True
 
     # ── Radio: derive an estimated goal in world frame ──────────────
+    # Every rescue runs the same loop: wait for a HELP ping → home in on
+    # the strongest signal → arrive → reset to wait. (estimate_goal_from_radio
+    # already picks the strongest packet, so a future multi-pinger world
+    # works without changes here.)
     est = estimate_goal_from_radio(robot_x, robot_y, heading)
     if est is not None:
         gx, gy, strength = est
 
-        # Arrival check
-        if strength > S_ARRIVE:
+        # Arrival: same logic for every rescue
+        if ping_received and strength > S_ARRIVE:
+            rescues_completed += 1
+            print("[scout] rescue #%d reached (strength=%.4f, t=%.1f s)"
+                  % (rescues_completed, strength, sim_time))
             left_motor.setVelocity(0.0)
             right_motor.setVelocity(0.0)
-            print("[scout] arrived — strength=%.4f at sim_time=%.1f s" % (strength, sim_time))
-            draw_map(robot_px, robot_py, goal_px, goal_py)
-            save_map_image()
-            break
+            if rescues_completed >= MAX_RESCUES:
+                draw_map(robot_px, robot_py, goal_px, goal_py)
+                save_map_image()
+                break
+            # Reset to wait-for-ping. Occupancy survives; cost matrix will
+            # be regenerated by replan() when the next HELP arrives.
+            ping_received = False
+            goal_x, goal_y = 0.0, 0.0
+            print("[scout] waiting for next HELP request ...")
 
-        # Update goal (and replan) on first ping or significant move
-        if (not ping_received
+        # Update real-radio goal on first ping or significant move
+        elif (not ping_received
                 or math.hypot(gx - goal_x, gy - goal_y) > GOAL_MOVE_THRESH):
             goal_x, goal_y = gx, gy
             if not ping_received:
                 ping_received = True
-                print("[scout] first HELP — engaging gradient navigation")
+                print("[scout] HELP received — engaging gradient navigation")
             replan()
             map_changed = True
             goal_px, goal_py = world_to_pix(goal_x, goal_y)
-
-    # ── Time limit ──────────────────────────────────────────────────
-    if sim_time >= SIM_TIME_LIMIT:
-        left_motor.setVelocity(0.0)
-        right_motor.setVelocity(0.0)
-        print("[scout] time limit reached (%.1f s)" % sim_time)
-        draw_map(robot_px, robot_py, goal_px, goal_py)
-        save_map_image()
-        break
 
     # ── Phase 1: no ping yet → sit still and scan ───────────────────
     if not ping_received:
@@ -603,8 +727,8 @@ while robot.step(TIME_STEP) != -1:
             draw_map(robot_px, robot_py, goal_px, goal_py)
         continue
 
-    # ── Phase 2: pure gradient descent (no reactive avoidance) ──────
-    lookahead_px, lookahead_py = follow_gradient(robot_px, robot_py)
+    # ── Phase 2: pure gradient descent (reactive override disabled) ─
+    lookahead_px, lookahead_py = follow_gradient(robot_px, robot_py, heading)
     lookahead_wx, lookahead_wy = pix_to_world(lookahead_px, lookahead_py)
     lv, rv = steer_to(robot_x, robot_y, heading, lookahead_wx, lookahead_wy)
     left_motor.setVelocity(lv)
