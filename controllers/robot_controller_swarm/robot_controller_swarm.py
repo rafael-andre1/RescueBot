@@ -48,8 +48,8 @@ CRUISE_SPEED     = 3.0
 MAX_SPEED        = 6.28
 SIM_TIME_LIMIT   = 180.0
 
-RADIO_STOP_DIST  = 0.35
-CAMERA_DIST      = 0.80
+RADIO_STOP_DIST  = 0.35    # legacy proximity fallback (unused as arrival)
+CAMERA_DIST      = 1.50    # scan the camera within this estimated range
 
 MAP_SIZE         = 400
 MAP_CENTRE       = MAP_SIZE // 2
@@ -352,6 +352,98 @@ def avoid_or(lv, rv, ranges):
 def spiral_cmd(t):
     omega = max(SPIRAL_OMEGA_MIN, SPIRAL_OMEGA0 - SPIRAL_DECAY * t)
     return CRUISE_SPEED - omega, CRUISE_SPEED + omega
+
+
+# ═══════════════════════════════════════════════════════════════════
+#  Potential-field navigator — ping is goal, lidar beams repel
+# ═══════════════════════════════════════════════════════════════════
+#
+# Sum-of-vectors steering:
+#   • One ATTRACTION vector of unit length in the ping bearing direction.
+#   • One REPULSION vector per close lidar beam in the forward hemisphere,
+#     pointing AWAY from the obstacle, magnitude growing quadratically as
+#     the beam gets close (capped beyond NAV_REPULSE_DIST → no effect).
+# The resultant gives a smoothly-changing desired heading. There is no
+# "committed wall side" anywhere — the ping always wins direction choice,
+# the robot just deflects tangentially around obstacles. That removes both
+# the stutter (no per-step bang-bang) and the wrong-wall problem (no
+# side commitment to be wrong about).
+#
+# Wall hugging is allowed: NAV_REPULSE_DIST is tight (0.30 m) so we don't
+# bounce off walls early. Forward speed throttles down only when the
+# front cone gets near NAV_SLOW_DIST.
+#
+NAV_REPULSE_DIST   = 0.30    # only beams closer than this repel
+NAV_REPULSE_GAIN   = 2.2     # repulsion strength vs unit attraction
+NAV_SLOW_DIST      = 0.28    # front clearance below this throttles speed
+NAV_MIN_SPEED      = 1.2     # always keep some headway unless turning hard
+NAV_FRONT_CONE     = math.radians(20)
+NAV_HEMISPHERE     = math.pi / 2
+NAV_BEAM_STRIDE    = 3       # subsample lidar (360 beams → ~120 evaluated)
+NAV_TURN_K         = 4.5     # heading-error → angular velocity gain
+
+
+def navigate(ranges, ping_bearing):
+    """Smooth ping-following with potential-field obstacle deflection."""
+    if not ranges:
+        return steer_to_bearing(ping_bearing)
+
+    n = len(ranges)
+    # Attraction (unit vector toward ping in robot frame)
+    ax = math.cos(ping_bearing)
+    ay = math.sin(ping_bearing)
+    # Repulsion accumulator
+    rx = 0.0
+    ry = 0.0
+    front_clear = INF
+
+    for i in range(0, n, NAV_BEAM_STRIDE):
+        r = ranges[i]
+        if r <= 0.0 or math.isinf(r) or math.isnan(r):
+            continue
+        angle = beam_angle(i, n)
+        # Track narrow front clearance for speed scaling
+        if abs(angle) < NAV_FRONT_CONE and r < front_clear:
+            front_clear = r
+        # Only forward hemisphere contributes repulsion (don't push from behind)
+        if abs(angle) > NAV_HEMISPHERE:
+            continue
+        if r >= NAV_REPULSE_DIST:
+            continue
+        # Quadratic strength: gentle far, urgent close.
+        t = (NAV_REPULSE_DIST - r) / NAV_REPULSE_DIST   # 0..1
+        strength = NAV_REPULSE_GAIN * t * t
+        # Vector AWAY from the beam direction
+        rx -= math.cos(angle) * strength
+        ry -= math.sin(angle) * strength
+
+    # Resultant desired heading (robot frame).
+    dx = ax + rx
+    dy = ay + ry
+    if dx * dx + dy * dy < 1e-3:
+        # Trapped — resultant cancelled out. Pivot in place toward open side.
+        # Pick whichever half-space has more total clearance.
+        return (-TURN_SPEED, TURN_SPEED) if ping_bearing >= 0 else (TURN_SPEED, -TURN_SPEED)
+    desired = math.atan2(dy, dx)
+
+    # Convert (desired, speed_factor) → wheel speeds
+    if front_clear < NAV_SLOW_DIST:
+        speed_factor = max(0.15, front_clear / NAV_SLOW_DIST)
+    else:
+        speed_factor = 1.0
+    cruise = CRUISE_SPEED * speed_factor
+
+    error = desired
+    while error >  math.pi: error -= 2.0 * math.pi
+    while error < -math.pi: error += 2.0 * math.pi
+    omega   = NAV_TURN_K * error
+    forward = cruise * max(0.0, 1.0 - 2.0 * abs(error) / math.pi)
+    # Floor forward to NAV_MIN_SPEED unless we're sharply turning or boxed in
+    if abs(error) < math.pi / 2 and front_clear > NAV_SLOW_DIST and forward < NAV_MIN_SPEED:
+        forward = NAV_MIN_SPEED
+    lv = max(-MAX_SPEED, min(MAX_SPEED, forward - omega))
+    rv = max(-MAX_SPEED, min(MAX_SPEED, forward + omega))
+    return lv, rv
 
 
 # ═══════════════════════════════════════════════════════════════════
@@ -689,21 +781,10 @@ while robot.step(TIME_STEP) != -1:
             draw_map(robot_px, robot_py, trajectory)
         continue
 
-    # ── Phase 2: radio homing ─────────────────────────────────────
+    # ── Phase 2: potential-field homing; arrival = camera colour ID ──
 
-    if last_range < RADIO_STOP_DIST:
-        left_motor.setVelocity(0.0)
-        right_motor.setVelocity(0.0)
-        pinger_pix   = (robot_px, robot_py)
-        pinger_local = (local_x, local_y)
-        print("[scout %s] proximity stop — est. %.2f m in %.1f s"
-              % (ROBOT_ID, last_range, sim_time))
-        draw_map(robot_px, robot_py, trajectory, pinger_pix, camera_active)
-        reached = True
-        emit_staged_map(pinger_local, trajectory, sim_time)
-        emit_staged_map._last_stage = len(load_all_states())
-        continue
-
+    # Camera scan: arrival trigger. As soon as the target colour is
+    # identified, stop and emit the staged map — no proximity wait.
     if last_range < CAMERA_DIST:
         if not camera_active:
             camera_active = True
@@ -716,12 +797,21 @@ while robot.step(TIME_STEP) != -1:
                       % (ROBOT_ID, count, TARGET_COL, TARGET_PIXEL_MIN))
             if found:
                 person_found = True
-                print("[scout %s] FOUND %s PERSON"
-                      % (ROBOT_ID, TARGET_COL.upper()))
+                print("[scout %s] FOUND %s PERSON — colour ID at est. %.2f m, %.1f s"
+                      % (ROBOT_ID, TARGET_COL.upper(), last_range, sim_time))
+                left_motor.setVelocity(0.0)
+                right_motor.setVelocity(0.0)
+                pinger_pix   = (robot_px, robot_py)
+                pinger_local = (local_x, local_y)
+                draw_map(robot_px, robot_py, trajectory, pinger_pix, camera_active)
+                reached = True
+                emit_staged_map(pinger_local, trajectory, sim_time)
+                emit_staged_map._last_stage = len(load_all_states())
+                continue
 
-    lv, rv = steer_to_bearing(last_bearing)
-    if last_range > CAMERA_DIST:
-        lv, rv = avoid_or(lv, rv, ranges)
+    # Motion: potential-field navigator. Ping bearing attracts, close
+    # lidar beams repel — smooth deflection, no committed wall side.
+    lv, rv = navigate(ranges, last_bearing)
     left_motor.setVelocity(lv)
     right_motor.setVelocity(rv)
 
