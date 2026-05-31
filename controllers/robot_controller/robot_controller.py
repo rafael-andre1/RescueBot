@@ -61,7 +61,9 @@ S_ARRIVE         = 6.25         # signal strength threshold → declare arrival.
                                 # same distance.
 
 #  Continuous rescue
-MAX_RESCUES        = 10         # stop after this many help requests handled
+MAX_RESCUES        = 5        # stop after this many help requests handled
+SILENCE_TIMEOUT    = 5.0      # if no HELP ping for this long after the first
+                              # was heard, assume the mission ended and save
 
 #  Display
 DRAW_INTERVAL    = 16
@@ -569,28 +571,117 @@ def steer_to(robot_x, robot_y, heading, target_wx, target_wy):
 # ═══════════════════════════════════════════════════════════════════
 #  Display
 # ═══════════════════════════════════════════════════════════════════
-def save_map_image(filename="slam_map.png"):
+def save_map_image(robot_maps, filename="slam_map.png"):
+    """Render a polished SLAM map (matplotlib). Mirrors the export from
+    robot_controller_radio.py — multi-robot-ready, but currently called with
+    a single-element list.
+
+    robot_maps: list[dict] with keys:
+        hits, visits     – MAP_SIZE × MAP_SIZE 2-D lists
+        origin           – (wx, wy) of this robot's starting position
+        trajectory       – list of (wx, wy)
+        pinger_positions – list of (wx, wy)  (places this robot rescued)
+        label            – display name
+    """
     try:
-        from PIL import Image
-        img = Image.new("RGB", (MAP_SIZE, MAP_SIZE), (221, 221, 221))
-        pix = img.load()
-        for y in range(MAP_SIZE):
-            for x in range(MAP_SIZE):
-                occ = get_occupancy(x, y)
-                if occ > IMPASSABLE:
-                    pix[x, y] = (0, 0, 0)
-                elif occ > WALL_CERTAINTY:
-                    t = (occ - WALL_CERTAINTY) / (IMPASSABLE - WALL_CERTAINTY)
-                    pix[x, y] = (int(180 + 75 * t), int(120 * (1.0 - t)), 0)
-                elif inflated[y][x] == 1:
-                    pix[x, y] = (68, 68, 68)
-                elif visits[y][x] > 0:
-                    g = int(180 + 60 * (1.0 - occ / WALL_CERTAINTY))
-                    pix[x, y] = (40, g, 40)
-        img.save(filename)
-        print("[scout] map saved → " + filename)
+        import numpy as np
+        import matplotlib
+        matplotlib.use("Agg")
+        import matplotlib.pyplot as plt
+        import matplotlib.patches as mpatches
+        from matplotlib.lines import Line2D
     except ImportError:
-        print("[scout] install Pillow to enable image save:  pip install Pillow")
+        print("[scout] install matplotlib + numpy:  pip install matplotlib numpy")
+        return
+
+    # ── Merge all robots into one global occupancy grid ──────────────
+    g_hits   = np.zeros((MAP_SIZE, MAP_SIZE), dtype=np.int32)
+    g_visits = np.zeros((MAP_SIZE, MAP_SIZE), dtype=np.int32)
+    for rm in robot_maps:
+        ox, oy = rm["origin"]
+        off_px =  round(ox / WORLD_X_MAX * MAP_CENTRE)
+        off_py = -round(oy / WORLD_Y_MAX * MAP_CENTRE)
+        h = np.array(rm["hits"],   dtype=np.int32)
+        v = np.array(rm["visits"], dtype=np.int32)
+        sx0 = max(0, -off_px); sx1 = min(MAP_SIZE, MAP_SIZE - off_px)
+        dx0 = max(0,  off_px); dx1 = min(MAP_SIZE, MAP_SIZE + off_px)
+        sy0 = max(0, -off_py); sy1 = min(MAP_SIZE, MAP_SIZE - off_py)
+        dy0 = max(0,  off_py); dy1 = min(MAP_SIZE, MAP_SIZE + off_py)
+        if sx0 < sx1 and sy0 < sy1:
+            g_hits  [dy0:dy1, dx0:dx1] += h[sy0:sy1, sx0:sx1]
+            g_visits[dy0:dy1, dx0:dx1] += v[sy0:sy1, sx0:sx1]
+
+    with np.errstate(divide="ignore", invalid="ignore"):
+        occ = np.where(g_visits > 0, g_hits / g_visits, np.nan)
+
+    # Light-grey unexplored, white explored-free, dark-grey-ish walls.
+    img = np.full((MAP_SIZE, MAP_SIZE, 4), [0.93, 0.93, 0.93, 1.0], dtype=np.float32)
+    free_mask = (~np.isnan(occ)) & (occ <= WALL_CERTAINTY)
+    img[free_mask] = [1.0, 1.0, 1.0, 1.0]
+    wall_mask = (~np.isnan(occ)) & (occ > WALL_CERTAINTY)
+    t_wall = np.clip(
+        (occ[wall_mask] - WALL_CERTAINTY) / (IMPASSABLE - WALL_CERTAINTY), 0, 1)
+    shade = 0.35 * (1.0 - t_wall)
+    img[wall_mask, 0] = shade
+    img[wall_mask, 1] = shade
+    img[wall_mask, 2] = shade
+
+    fig, ax = plt.subplots(figsize=(8, 7), dpi=150)
+    ax.imshow(img, origin="upper",
+              extent=[-WORLD_X_MAX, WORLD_X_MAX, -WORLD_Y_MAX, WORLD_Y_MAX],
+              aspect="equal", interpolation="nearest")
+    ax.set_xlabel("X (m)", fontsize=9)
+    ax.set_ylabel("Y (m)", fontsize=9)
+    n = len(robot_maps)
+    ax.set_title("SLAM Map — %d robot%s" % (n, "s" if n != 1 else ""), fontsize=11)
+    ax.grid(True, linestyle="--", linewidth=0.4, alpha=0.4, color="#888888")
+
+    legend_handles = [
+        mpatches.Patch(facecolor=(0.20, 0.20, 0.20), label="Wall"),
+        mpatches.Patch(facecolor=(1.00, 1.00, 1.00),
+                       edgecolor="gray", linewidth=0.5, label="Free (explored)"),
+        mpatches.Patch(facecolor=(0.93, 0.93, 0.93),
+                       edgecolor="gray", linewidth=0.5, label="Unexplored"),
+    ]
+
+    colors = plt.cm.tab10.colors
+    for i, rm in enumerate(robot_maps):
+        c     = colors[i % len(colors)]
+        lbl   = rm.get("label", "Robot %d" % (i + 1))
+        ox, oy = rm["origin"]
+        traj  = rm.get("trajectory", [])
+        ppos  = rm.get("pinger_positions", [])
+
+        if len(traj) > 1:
+            tx, ty = zip(*traj)
+            ax.plot(tx, ty, color=c, linewidth=1.1, alpha=0.85, zorder=3)
+            legend_handles.append(
+                Line2D([0], [0], color=c, linewidth=1.5,
+                       label="%s trajectory" % lbl))
+
+        ax.plot(ox, oy, marker="P", color=c, markersize=9,
+                markeredgecolor="white", markeredgewidth=0.7, zorder=5)
+        legend_handles.append(
+            Line2D([0], [0], marker="P", color="w", markerfacecolor=c,
+                   markersize=8, label="%s start" % lbl))
+
+        if ppos:
+            px = [p[0] for p in ppos]
+            py = [p[1] for p in ppos]
+            ax.plot(px, py, linestyle="none", marker="*", color="crimson",
+                    markersize=14, zorder=6,
+                    markeredgecolor="darkred", markeredgewidth=0.5)
+            legend_handles.append(
+                Line2D([0], [0], marker="*", color="w",
+                       markerfacecolor="crimson", markersize=10,
+                       label="%s rescues" % lbl))
+
+    ax.legend(handles=legend_handles, loc="upper left",
+              fontsize=7, framealpha=0.9, edgecolor="gray")
+    fig.tight_layout()
+    fig.savefig(filename, dpi=150, bbox_inches="tight")
+    plt.close(fig)
+    print("[scout] map saved → " + filename)
 
 
 def draw_map(robot_px, robot_py, goal_px, goal_py,
@@ -640,7 +731,12 @@ goal_x, goal_y = 0.0, 0.0          # placeholder; set on first ping
 robot_x, robot_y = 0.0, 0.0        # dead-reckoned pose, map origin = start
 prev_left_enc  = None              # initialised on first iteration
 prev_right_enc = None
-rescues_completed = 0              # how many help requests handled so far
+rescues_completed  = 0             # how many help requests handled so far
+origin_x, origin_y = 0.0, 0.0      # dead-reckoned frame origin (always 0,0 here)
+trajectory         = []            # list of (wx, wy) — robot path for the map
+rescued_positions  = []            # list of (wx, wy) — where each rescue happened
+last_ping_time     = 0.0           # sim_time of the most recent HELP packet
+any_ping_ever      = False         # have we heard at least one HELP yet?
 
 print("[scout] online — sitting still until first HELP ping")
 
@@ -674,6 +770,7 @@ while robot.step(TIME_STEP) != -1:
     # ── SLAM: update map and replan whenever a cell changes state ───
     if current_cell != prev_cell:
         prev_cell = current_cell
+        trajectory.append((robot_x, robot_y))     # for the saved map
         state_changed = False
         if ranges:
             state_changed = scan_lidar(robot_x, robot_y, heading, ranges)
@@ -690,17 +787,27 @@ while robot.step(TIME_STEP) != -1:
     est = estimate_goal_from_radio(robot_x, robot_y, heading)
     if est is not None:
         gx, gy, strength = est
+        last_ping_time = sim_time
+        any_ping_ever  = True
 
-        # Arrival: same logic for every rescue
-        if ping_received and strength > S_ARRIVE:
+        # Arrival: same logic for every rescue (>= so we don't miss the boundary
+        # where signal_controller advances at d=0.40 m exactly).
+        if ping_received and strength >= S_ARRIVE:
             rescues_completed += 1
+            rescued_positions.append((robot_x, robot_y))    # for the saved map
             print("[scout] rescue #%d reached (strength=%.4f, t=%.1f s)"
                   % (rescues_completed, strength, sim_time))
             left_motor.setVelocity(0.0)
             right_motor.setVelocity(0.0)
             if rescues_completed >= MAX_RESCUES:
                 draw_map(robot_px, robot_py, goal_px, goal_py)
-                save_map_image()
+                save_map_image([{
+                    "hits": hits, "visits": visits,
+                    "origin": (origin_x, origin_y),
+                    "trajectory": trajectory,
+                    "pinger_positions": rescued_positions,
+                    "label": "Scout",
+                }])
                 break
             # Reset to wait-for-ping. Occupancy survives; cost matrix will
             # be regenerated by replan() when the next HELP arrives.
@@ -718,6 +825,23 @@ while robot.step(TIME_STEP) != -1:
             replan()
             map_changed = True
             goal_px, goal_py = world_to_pix(goal_x, goal_y)
+
+    # ── End-of-mission: signal stopped emitting → save and exit ─────
+    if any_ping_ever and (sim_time - last_ping_time) > SILENCE_TIMEOUT:
+        print("[scout] no HELP for %.1f s — mission complete (%d rescue%s)"
+              % (SILENCE_TIMEOUT, rescues_completed,
+                 "s" if rescues_completed != 1 else ""))
+        left_motor.setVelocity(0.0)
+        right_motor.setVelocity(0.0)
+        draw_map(robot_px, robot_py, goal_px, goal_py)
+        save_map_image([{
+            "hits": hits, "visits": visits,
+            "origin": (origin_x, origin_y),
+            "trajectory": trajectory,
+            "pinger_positions": rescued_positions,
+            "label": "Scout",
+        }])
+        break
 
     # ── Phase 1: no ping yet → sit still and scan ───────────────────
     if not ping_received:

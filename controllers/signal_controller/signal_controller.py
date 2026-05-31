@@ -18,7 +18,7 @@ import random
 from controller import Supervisor
 
 TIME_STEP     = 32
-NUM_BEACONS   = 10
+NUM_BEACONS   = 5
 RESCUE_RADIUS = 0.40       # scout within this distance counts as a rescue (m)
 BEACON_Z      = 0.05
 SCOUT_NAME    = "scout"

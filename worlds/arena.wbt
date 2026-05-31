@@ -71,6 +71,78 @@ Solid {
     size 1.5 0.05 0.3
   }
 }
+Solid {
+  translation -2 0.5 0.15
+  children [
+    Shape {
+      appearance PBRAppearance {
+        baseColor 0.7 0.4 0.2
+        roughness 1
+      }
+      geometry Box {
+        size 0.05 2 0.3
+      }
+    }
+  ]
+  name "wall_4"
+  boundingObject Box {
+    size 0.05 2 0.3
+  }
+}
+Solid {
+  translation 2 -1.5 0.15
+  children [
+    Shape {
+      appearance PBRAppearance {
+        baseColor 0.7 0.4 0.2
+        roughness 1
+      }
+      geometry Box {
+        size 2 0.05 0.3
+      }
+    }
+  ]
+  name "wall_5"
+  boundingObject Box {
+    size 2 0.05 0.3
+  }
+}
+Solid {
+  translation 2.5 1.25 0.15
+  children [
+    Shape {
+      appearance PBRAppearance {
+        baseColor 0.7 0.4 0.2
+        roughness 1
+      }
+      geometry Box {
+        size 0.05 2 0.3
+      }
+    }
+  ]
+  name "wall_6"
+  boundingObject Box {
+    size 0.05 2 0.3
+  }
+}
+Solid {
+  translation -1 1 0.15
+  children [
+    Shape {
+      appearance PBRAppearance {
+        baseColor 0.7 0.4 0.2
+        roughness 1
+      }
+      geometry Box {
+        size 1 0.05 0.3
+      }
+    }
+  ]
+  name "wall_7"
+  boundingObject Box {
+    size 1 0.05 0.3
+  }
+}
 
 E-puck {
   translation 0 0 0
