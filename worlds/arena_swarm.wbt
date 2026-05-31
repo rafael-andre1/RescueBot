@@ -1,0 +1,338 @@
+#VRML_SIM R2025a utf8
+EXTERNPROTO "https://raw.githubusercontent.com/cyberbotics/webots/R2025a/projects/objects/backgrounds/protos/TexturedBackground.proto"
+EXTERNPROTO "https://raw.githubusercontent.com/cyberbotics/webots/R2025a/projects/objects/backgrounds/protos/TexturedBackgroundLight.proto"
+EXTERNPROTO "https://raw.githubusercontent.com/cyberbotics/webots/R2025a/projects/objects/floors/protos/Floor.proto"
+EXTERNPROTO "https://raw.githubusercontent.com/cyberbotics/webots/R2025a/projects/robots/gctronic/e-puck/protos/E-puck.proto"
+
+WorldInfo {
+  basicTimeStep 32
+}
+Viewpoint {
+  orientation -0.3714576357318767 -0.37673088126522425 0.8485829764717248 4.518781458128897
+  position 0.0 22.0 22.0
+}
+TexturedBackground {
+}
+TexturedBackgroundLight {
+}
+Floor {
+  size 9 7
+  tileSize 1 1
+}
+
+# ───── Outer walls (9 × 7 bounding box) ────────────────────────────
+Solid {
+  translation -4.5 0 0.15
+  children [
+    Shape {
+      appearance PBRAppearance { baseColor 0.6 0.35 0.18 roughness 1 }
+      geometry Box { size 0.05 7 0.3 }
+    }
+  ]
+  name "outer_west"
+  boundingObject Box { size 0.05 7 0.3 }
+}
+Solid {
+  translation 4.5 0 0.15
+  children [
+    Shape {
+      appearance PBRAppearance { baseColor 0.6 0.35 0.18 roughness 1 }
+      geometry Box { size 0.05 7 0.3 }
+    }
+  ]
+  name "outer_east"
+  boundingObject Box { size 0.05 7 0.3 }
+}
+Solid {
+  translation 0 3.5 0.15
+  children [
+    Shape {
+      appearance PBRAppearance { baseColor 0.6 0.35 0.18 roughness 1 }
+      geometry Box { size 9 0.05 0.3 }
+    }
+  ]
+  name "outer_north"
+  boundingObject Box { size 9 0.05 0.3 }
+}
+Solid {
+  translation 0 -3.5 0.15
+  children [
+    Shape {
+      appearance PBRAppearance { baseColor 0.6 0.35 0.18 roughness 1 }
+      geometry Box { size 9 0.05 0.3 }
+    }
+  ]
+  name "outer_south"
+  boundingObject Box { size 9 0.05 0.3 }
+}
+
+# ───── Top-right (red) corner labyrinth — enter through east gap ───
+Solid {
+  translation 2.5 1.8 0.15
+  children [
+    Shape {
+      appearance PBRAppearance { baseColor 0.7 0.4 0.2 roughness 1 }
+      geometry Box { size 2.0 0.05 0.3 }
+    }
+  ]
+  name "labyrinth_tr_h"
+  boundingObject Box { size 2.0 0.05 0.3 }
+}
+Solid {
+  translation 1.5 2.65 0.15
+  children [
+    Shape {
+      appearance PBRAppearance { baseColor 0.7 0.4 0.2 roughness 1 }
+      geometry Box { size 0.05 1.7 0.3 }
+    }
+  ]
+  name "labyrinth_tr_v"
+  boundingObject Box { size 0.05 1.7 0.3 }
+}
+
+# ───── Top-left (yellow) corner labyrinth — enter through west gap ─
+Solid {
+  translation -2.5 1.8 0.15
+  children [
+    Shape {
+      appearance PBRAppearance { baseColor 0.7 0.4 0.2 roughness 1 }
+      geometry Box { size 2.0 0.05 0.3 }
+    }
+  ]
+  name "labyrinth_tl_h"
+  boundingObject Box { size 2.0 0.05 0.3 }
+}
+Solid {
+  translation -1.5 2.65 0.15
+  children [
+    Shape {
+      appearance PBRAppearance { baseColor 0.7 0.4 0.2 roughness 1 }
+      geometry Box { size 0.05 1.7 0.3 }
+    }
+  ]
+  name "labyrinth_tl_v"
+  boundingObject Box { size 0.05 1.7 0.3 }
+}
+
+# ───── Bottom-right (green) corner labyrinth — enter through east gap ─
+Solid {
+  translation 2.5 -1.8 0.15
+  children [
+    Shape {
+      appearance PBRAppearance { baseColor 0.7 0.4 0.2 roughness 1 }
+      geometry Box { size 2.0 0.05 0.3 }
+    }
+  ]
+  name "labyrinth_br_h"
+  boundingObject Box { size 2.0 0.05 0.3 }
+}
+Solid {
+  translation 1.5 -2.65 0.15
+  children [
+    Shape {
+      appearance PBRAppearance { baseColor 0.7 0.4 0.2 roughness 1 }
+      geometry Box { size 0.05 1.7 0.3 }
+    }
+  ]
+  name "labyrinth_br_v"
+  boundingObject Box { size 0.05 1.7 0.3 }
+}
+
+# ───── Central clutter — forces detours, keeps start zone clear ────
+Solid {
+  translation -2.0 0.5 0.15
+  children [
+    Shape {
+      appearance PBRAppearance { baseColor 0.65 0.38 0.2 roughness 1 }
+      geometry Box { size 0.05 1.5 0.3 }
+    }
+  ]
+  name "centre_left_v"
+  boundingObject Box { size 0.05 1.5 0.3 }
+}
+Solid {
+  translation 2.0 -0.5 0.15
+  children [
+    Shape {
+      appearance PBRAppearance { baseColor 0.65 0.38 0.2 roughness 1 }
+      geometry Box { size 0.05 1.5 0.3 }
+    }
+  ]
+  name "centre_right_v"
+  boundingObject Box { size 0.05 1.5 0.3 }
+}
+Solid {
+  translation 0.0 1.5 0.15
+  children [
+    Shape {
+      appearance PBRAppearance { baseColor 0.65 0.38 0.2 roughness 1 }
+      geometry Box { size 1.5 0.05 0.3 }
+    }
+  ]
+  name "centre_mid_h"
+  boundingObject Box { size 1.5 0.05 0.3 }
+}
+Solid {
+  translation -0.8 -1.8 0.15
+  children [
+    Shape {
+      appearance PBRAppearance { baseColor 0.65 0.38 0.2 roughness 1 }
+      geometry Box { size 1.2 0.05 0.3 }
+    }
+  ]
+  name "centre_low_h"
+  boundingObject Box { size 1.2 0.05 0.3 }
+}
+
+# ═══════════════════════════════════════════════════════════════════
+#  Pingers — three coloured beacons in three far corners, one per channel
+# ═══════════════════════════════════════════════════════════════════
+Robot {
+  translation 3.8 2.8 0.05
+  children [
+    Shape {
+      appearance PBRAppearance {
+        baseColor 1 0 0
+        emissiveColor 1 0 0
+        roughness 0.2
+        metalness 0
+      }
+      geometry Box { size 0.15 0.15 0.1 }
+    }
+    Emitter {
+      name "emitter"
+      channel 1
+    }
+  ]
+  name "pinger_red"
+  controller "signal_controller_swarm"
+}
+Robot {
+  translation -3.8 2.8 0.05
+  children [
+    Shape {
+      appearance PBRAppearance {
+        baseColor 1 1 0
+        emissiveColor 1 1 0
+        roughness 0.2
+        metalness 0
+      }
+      geometry Box { size 0.15 0.15 0.1 }
+    }
+    Emitter {
+      name "emitter"
+      channel 2
+    }
+  ]
+  name "pinger_yellow"
+  controller "signal_controller_swarm"
+}
+Robot {
+  translation 3.8 -2.8 0.05
+  children [
+    Shape {
+      appearance PBRAppearance {
+        baseColor 0 1 0
+        emissiveColor 0 1 0
+        roughness 0.2
+        metalness 0
+      }
+      geometry Box { size 0.15 0.15 0.1 }
+    }
+    Emitter {
+      name "emitter"
+      channel 3
+    }
+  ]
+  name "pinger_green"
+  controller "signal_controller_swarm"
+}
+
+# ═══════════════════════════════════════════════════════════════════
+#  Swarm scouts — three e-pucks near origin, triangle spacing to avoid
+#  collisions, each tuned to its own pinger channel + colour.
+# ═══════════════════════════════════════════════════════════════════
+E-puck {
+  translation 0.0 0.30 0.0
+  rotation 0 0 1 0.582
+  name "scout_red"
+  controller "robot_controller_swarm"
+  controllerArgs ["1" "red" "0.0" "0.30"]
+  receiver_channel 1
+  camera_fieldOfView 1.047
+  camera_width 128
+  camera_height 96
+  turretSlot [
+    Lidar {
+      translation 0 0 0.02
+      horizontalResolution 360
+      fieldOfView 6.283185
+      numberOfLayers 1
+      maxRange 5
+    }
+    Display {
+      name "map_display"
+      width 400
+      height 400
+    }
+    Compass {
+      name "compass"
+    }
+  ]
+}
+E-puck {
+  translation -0.26 -0.15 0.0
+  rotation 0 0 1 2.447
+  name "scout_yellow"
+  controller "robot_controller_swarm"
+  controllerArgs ["2" "yellow" "-0.26" "-0.15"]
+  receiver_channel 2
+  camera_fieldOfView 1.047
+  camera_width 128
+  camera_height 96
+  turretSlot [
+    Lidar {
+      translation 0 0 0.02
+      horizontalResolution 360
+      fieldOfView 6.283185
+      numberOfLayers 1
+      maxRange 5
+    }
+    Display {
+      name "map_display"
+      width 400
+      height 400
+    }
+    Compass {
+      name "compass"
+    }
+  ]
+}
+E-puck {
+  translation 0.26 -0.15 0.0
+  rotation 0 0 1 -0.642
+  name "scout_green"
+  controller "robot_controller_swarm"
+  controllerArgs ["3" "green" "0.26" "-0.15"]
+  receiver_channel 3
+  camera_fieldOfView 1.047
+  camera_width 128
+  camera_height 96
+  turretSlot [
+    Lidar {
+      translation 0 0 0.02
+      horizontalResolution 360
+      fieldOfView 6.283185
+      numberOfLayers 1
+      maxRange 5
+    }
+    Display {
+      name "map_display"
+      width 400
+      height 400
+    }
+    Compass {
+      name "compass"
+    }
+  ]
+}

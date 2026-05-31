@@ -1,39 +1,84 @@
+"""
+robot_controller_swarm — one scout in a 3-robot SAR swarm.
+
+Each scout is parameterised from the world file via controllerArgs:
+    controllerArgs ["<id>" "<colour>"]
+        id     — "1" | "2" | "3"
+        colour — "red" | "yellow" | "green"   (matches its pinger)
+
+Bound by the world file: receiver_channel == pinger emitter channel.
+So colour ↔ channel ↔ scout is set in arena_swarm.wbt; this code just
+honours its assigned identity.
+
+Inter-robot coordination: when a scout reaches its person it pickles
+its full SLAM state to  ./slam_state_<id>.pkl . Every scout watches
+that directory; the n-th scout to arrive loads the n state files in
+arrival order and writes  ./slam_map_stage<n>.png  — a combined map
+re-centred on the FIRST scout's origin (its start becomes the new (0,0)).
+"""
 from controller import Robot
-import math
+import math, os, sys, time, pickle, glob
+
+# ── Identity from controllerArgs ──────────────────────────────────────────
+#   controllerArgs ["<id>" "<colour>" "<start_x>" "<start_y>"]
+# start_x / start_y are the scout's world translation, declared in the world
+# file. They are the ONLY cross-robot spatial datum we keep — no GPS reads.
+# Each scout maps in its own local frame (origin = its own start); the merge
+# step uses the saved start vectors to translate peers into the first
+# finder's frame.
+ROBOT_ID    = sys.argv[1] if len(sys.argv) > 1 else "1"
+TARGET_COL  = (sys.argv[2] if len(sys.argv) > 2 else "red").lower()
+START_X     = float(sys.argv[3]) if len(sys.argv) > 3 else 0.0
+START_Y     = float(sys.argv[4]) if len(sys.argv) > 4 else 0.0
+LABEL       = "Robot %s (%s)" % (ROBOT_ID, TARGET_COL)
+
+# Colour-specific camera thresholds: (R_min, R_max, G_min, G_max, B_min, B_max)
+COLOUR_BANDS = {
+    "red":    (200, 255,   0,  60,   0,  60),
+    "yellow": (200, 255, 200, 255,   0,  80),
+    "green":  (  0,  80, 200, 255,   0,  80),
+}
+R_MIN, R_MAX, G_MIN, G_MAX, B_MIN, B_MAX = COLOUR_BANDS.get(
+    TARGET_COL, COLOUR_BANDS["red"])
+TARGET_PIXEL_MIN = 20
 
 # ── Tuning ────────────────────────────────────────────────────────────────
 TIME_STEP        = 32
 CRUISE_SPEED     = 3.0
 MAX_SPEED        = 6.28
-SIM_TIME_LIMIT   = 105.0            # 1 min 45 s
+SIM_TIME_LIMIT   = 180.0
 
-# ── Radio homing ──────────────────────────────────────────────────────────
-RADIO_STOP_DIST  = 0.35             # stop when estimated range < this (m)
-CAMERA_DIST      = 0.80             # activate camera scan within this range
+RADIO_STOP_DIST  = 0.35
+CAMERA_DIST      = 0.80
 
-# ── Camera red-target detection (255, 0, 0) ───────────────────────────────
-RED_R_MIN        = 200
-RED_G_MAX        = 60
-RED_B_MAX        = 60
-RED_PIXEL_MIN    = 20               # qualifying pixels to confirm a person
-
-# ── SLAM map ──────────────────────────────────────────────────────────────
-MAP_SIZE         = 400              # doubled resolution vs iteration 1
+MAP_SIZE         = 400
 MAP_CENTRE       = MAP_SIZE // 2
-WORLD_X_MAX      = 4.0              # metres from origin to map edge
-WORLD_Y_MAX      = 3.0
-OBSTACLE_INFLATE = 3                # pixels, scaled up for new resolution
+WORLD_X_MAX      = 4.5
+WORLD_Y_MAX      = 3.5
+OBSTACLE_INFLATE = 3
 
-# ── Occupancy thresholds ──────────────────────────────────────────────────
 WALL_CERTAINTY   = 0.30
 IMPASSABLE       = 0.90
 
-# ── Timing ────────────────────────────────────────────────────────────────
 DRAW_INTERVAL        = 16
-SIGNAL_PRINT_STEPS   = int(2.0 * 1000 / TIME_STEP)   # console update every 2 s
-CAM_PRINT_STEPS      = int(1.0 * 1000 / TIME_STEP)    # camera update every 1 s
+SIGNAL_PRINT_STEPS   = int(2.0 * 1000 / TIME_STEP)
+CAM_PRINT_STEPS      = int(1.0 * 1000 / TIME_STEP)
 
 INF = float("inf")
+
+# Shared-state directory (controller's CWD). Stamp on session start so
+# stale state files from a prior run are ignored.
+SESSION_START   = time.time()
+STATE_GLOB      = "slam_state_*.pkl"
+OWN_STATE_FILE  = "slam_state_%s.pkl" % ROBOT_ID
+
+# Clear our own stale state file so a previous run's "found" doesn't
+# poison this session's staged map.
+try:
+    if os.path.exists(OWN_STATE_FILE):
+        os.remove(OWN_STATE_FILE)
+except OSError:
+    pass
 
 # ═══════════════════════════════════════════════════════════════════
 #  Webots devices
@@ -60,28 +105,34 @@ CAM_H = camera.getHeight()
 receiver = robot.getDevice("receiver")
 receiver.enable(TIME_STEP)
 
-gps = robot.getDevice("gps")
-gps.enable(TIME_STEP)
+# ── Wheel-encoder odometry (no GPS) ───────────────────────────────────────
+# e-puck constants
+WHEEL_RADIUS = 0.0205   # m
+AXLE_LENGTH  = 0.052    # m  (wheel separation)
+
+left_ps  = robot.getDevice("left wheel sensor")
+right_ps = robot.getDevice("right wheel sensor")
+left_ps.enable(TIME_STEP)
+right_ps.enable(TIME_STEP)
 
 compass = robot.getDevice("compass")
 compass.enable(TIME_STEP)
 
 display = robot.getDevice("map_display")
 
-# Camera preview anchor: top-right corner of SLAM display
 CAM_PREV_X = MAP_SIZE - CAM_W // 2 - 2
 CAM_PREV_Y = 2
 
 # ═══════════════════════════════════════════════════════════════════
-#  Coordinate helpers — robot start position is map origin
+#  Coordinate helpers — everything lives in this scout's LOCAL frame
+#  (origin = (0,0) = its own start). Compass gives global heading, so
+#  every scout's local frame shares the same orientation as the world,
+#  which means peer maps can be merged by pure translation.
 # ═══════════════════════════════════════════════════════════════════
-origin_x = 0.0
-origin_y = 0.0
-
-
-def world_to_pix(wx, wy):
-    px = int(MAP_CENTRE + ((wx - origin_x) / WORLD_X_MAX) * MAP_CENTRE)
-    py = int(MAP_CENTRE - ((wy - origin_y) / WORLD_Y_MAX) * MAP_CENTRE)
+def world_to_pix(lx, ly):
+    # lx, ly are already in the local frame (start = origin).
+    px = int(MAP_CENTRE + (lx / WORLD_X_MAX) * MAP_CENTRE)
+    py = int(MAP_CENTRE - (ly / WORLD_Y_MAX) * MAP_CENTRE)
     return max(0, min(MAP_SIZE - 1, px)), max(0, min(MAP_SIZE - 1, py))
 
 
@@ -180,7 +231,6 @@ def read_radio():
 
 
 def steer_to_bearing(bearing):
-    """Proportional turn toward a robot-relative bearing (0=ahead, CCW+)."""
     error = bearing
     while error >  math.pi: error -= 2.0 * math.pi
     while error < -math.pi: error += 2.0 * math.pi
@@ -193,10 +243,9 @@ def steer_to_bearing(bearing):
 
 
 # ═══════════════════════════════════════════════════════════════════
-#  Camera — red detection + live preview on SLAM display
+#  Camera — colour-tuned target detection + live preview
 # ═══════════════════════════════════════════════════════════════════
-def scan_for_red():
-    """Return (found: bool, count: int) for (255,0,0)-like pixels."""
+def scan_for_target():
     img   = camera.getImage()
     count = 0
     for cy in range(CAM_H):
@@ -204,13 +253,14 @@ def scan_for_red():
             r = camera.imageGetRed(img,   CAM_W, cx, cy)
             g = camera.imageGetGreen(img, CAM_W, cx, cy)
             b = camera.imageGetBlue(img,  CAM_W, cx, cy)
-            if r > RED_R_MIN and g < RED_G_MAX and b < RED_B_MAX:
+            if (R_MIN <= r <= R_MAX and
+                G_MIN <= g <= G_MAX and
+                B_MIN <= b <= B_MAX):
                 count += 1
-    return count >= RED_PIXEL_MIN, count
+    return count >= TARGET_PIXEL_MIN, count
 
 
 def draw_camera_preview():
-    """Blit a half-scale camera frame into the top-right corner of the SLAM display."""
     img = camera.getImage()
     for cy in range(0, CAM_H, 2):
         for cx in range(0, CAM_W, 2):
@@ -219,7 +269,6 @@ def draw_camera_preview():
             b = camera.imageGetBlue(img,  CAM_W, cx, cy)
             display.setColor((r << 16) | (g << 8) | b)
             display.drawPixel(CAM_PREV_X + cx // 2, CAM_PREV_Y + cy // 2)
-    # White border
     display.setColor(0xFFFFFF)
     display.drawRectangle(CAM_PREV_X - 1, CAM_PREV_Y - 1,
                           CAM_W // 2 + 2, CAM_H // 2 + 2)
@@ -228,8 +277,15 @@ def draw_camera_preview():
 # ═══════════════════════════════════════════════════════════════════
 #  Reactive avoidance + search spiral
 # ═══════════════════════════════════════════════════════════════════
-AVOID_DISTANCE   = 0.22
-TURN_SPEED       = 4.0
+# ── Proactive, proportional avoidance ─────────────────────────────────────
+# Earlier trigger (FAR) lets the scout steer around obstacles smoothly
+# instead of charging until NEAR forces a spin-in-place. The bias only
+# scales up as proximity grows, so it won't latch onto a wall (no rigid
+# wall-following) and the maze approach stays responsive.
+AVOID_FAR        = 0.50    # start veering at this front distance
+AVOID_NEAR       = 0.18    # full pivot / hard stop below this
+TURN_SPEED       = 4.5
+SIDE_BIAS_GAIN   = 1.2     # gentle pushback from side clearances
 SPIRAL_OMEGA0    = 3.0
 SPIRAL_OMEGA_MIN = 0.4
 SPIRAL_DECAY     = 0.004
@@ -253,12 +309,44 @@ def lidar_sectors(ranges):
 
 
 def avoid_or(lv, rv, ranges):
+    """Proportional steer-and-slow. urgency=0 at AVOID_FAR, =1 at AVOID_NEAR.
+    Output blends commanded (lv,rv) with a turn bias toward the more open
+    side, plus light side-bias from left/right clearances."""
     if not ranges:
         return lv, rv
     front, left, right = lidar_sectors(ranges)
-    if front < AVOID_DISTANCE:
-        return (-TURN_SPEED, TURN_SPEED) if left > right else (TURN_SPEED, -TURN_SPEED)
-    return lv, rv
+
+    # Side pushback (always active but small): pushes away from a near side wall
+    side_bias = 0.0
+    if left  < AVOID_FAR: side_bias -= SIDE_BIAS_GAIN * (AVOID_FAR - left)
+    if right < AVOID_FAR: side_bias += SIDE_BIAS_GAIN * (AVOID_FAR - right)
+
+    if front >= AVOID_FAR:
+        # Apply side pushback only.
+        return (lv - side_bias, rv + side_bias) if abs(side_bias) > 0.01 else (lv, rv)
+
+    # Front cone is encroaching → compute urgency 0..1
+    if front <= AVOID_NEAR:
+        urgency = 1.0
+    else:
+        urgency = 1.0 - (front - AVOID_NEAR) / (AVOID_FAR - AVOID_NEAR)
+
+    # Forward speed scales down with urgency, but never quite halts unless very close
+    base = ((lv + rv) * 0.5) * max(0.0, 1.0 - 0.85 * urgency)
+    if urgency >= 1.0:
+        base = 0.0
+
+    bias = TURN_SPEED * urgency
+    if left > right:
+        out_l, out_r = base - bias, base + bias
+    else:
+        out_l, out_r = base + bias, base - bias
+
+    out_l -= side_bias
+    out_r += side_bias
+    out_l = max(-MAX_SPEED, min(MAX_SPEED, out_l))
+    out_r = max(-MAX_SPEED, min(MAX_SPEED, out_r))
+    return out_l, out_r
 
 
 def spiral_cmd(t):
@@ -267,14 +355,13 @@ def spiral_cmd(t):
 
 
 # ═══════════════════════════════════════════════════════════════════
-#  Display — SLAM + trajectory + pinger marker + camera preview
+#  Display
 # ═══════════════════════════════════════════════════════════════════
 def draw_map(robot_px, robot_py, trajectory,
              pinger_pix=None, show_camera=False):
     display.setColor(0xDDDDDD)
     display.fillRectangle(0, 0, MAP_SIZE, MAP_SIZE)
 
-    # Occupancy grid
     for y in range(MAP_SIZE):
         for x in range(MAP_SIZE):
             occ = get_occupancy(x, y)
@@ -292,7 +379,6 @@ def draw_map(robot_px, robot_py, trajectory,
                 continue
             display.drawPixel(x, y)
 
-    # Trajectory — cyan polyline (every 4th point to keep it fast)
     display.setColor(0x00CCCC)
     traj = trajectory[::4]
     for k in range(1, len(traj)):
@@ -300,29 +386,29 @@ def draw_map(robot_px, robot_py, trajectory,
         x1, y1 = world_to_pix(*traj[k])
         display.drawLine(x0, y0, x1, y1)
 
-    # Origin — white cross
     display.setColor(0xFFFFFF)
     display.drawLine(MAP_CENTRE - 5, MAP_CENTRE, MAP_CENTRE + 5, MAP_CENTRE)
     display.drawLine(MAP_CENTRE, MAP_CENTRE - 5, MAP_CENTRE, MAP_CENTRE + 5)
 
-    # Pinger — red square (drawn when proximity stop triggers)
     if pinger_pix is not None:
         display.setColor(0xFF0000)
         display.fillRectangle(pinger_pix[0] - 4, pinger_pix[1] - 4, 8, 8)
 
-    # Robot — blue dot
     display.setColor(0x0000FF)
     display.fillOval(robot_px, robot_py, 3, 3)
 
-    # Camera preview (top-right corner)
     if show_camera:
         draw_camera_preview()
 
 
 # ═══════════════════════════════════════════════════════════════════
-#  Image save — matplotlib composite, multi-robot ready
+#  Multi-robot map merge — staged combined PNG re-centred on first finder
 # ═══════════════════════════════════════════════════════════════════
-def save_map_image(robot_maps, filename="slam_map.png"):
+def save_map_image(robot_maps, filename, ref_start):
+    """Render up to N robot maps into one PNG, translated so that the
+    FIRST finder's start position becomes (0,0). Each peer map is
+    stored in its own local frame; the only datum needed to align them
+    is the start translation vector saved at world-build time."""
     try:
         import numpy as np
         import matplotlib
@@ -331,21 +417,25 @@ def save_map_image(robot_maps, filename="slam_map.png"):
         import matplotlib.patches as mpatches
         from matplotlib.lines import Line2D
     except ImportError:
-        print("[scout] install matplotlib + numpy:  pip install matplotlib numpy")
+        print("[scout %s] install matplotlib + numpy:  pip install matplotlib numpy"
+              % ROBOT_ID)
         return
 
-    # ── Merge all robots into one global occupancy grid ──────────────
+    rsx, rsy = ref_start
+
     g_hits   = np.zeros((MAP_SIZE, MAP_SIZE), dtype=np.int32)
     g_visits = np.zeros((MAP_SIZE, MAP_SIZE), dtype=np.int32)
 
     for rm in robot_maps:
-        ox, oy = rm["origin"]
-        off_px =  round(ox / WORLD_X_MAX * MAP_CENTRE)
-        off_py = -round(oy / WORLD_Y_MAX * MAP_CENTRE)
+        sx, sy = rm["start_pos"]
+        # Translation that places this scout's local (0,0) at the
+        # right spot in the first finder's frame.
+        dx, dy = sx - rsx, sy - rsy
+        off_px =  round(dx / WORLD_X_MAX * MAP_CENTRE)
+        off_py = -round(dy / WORLD_Y_MAX * MAP_CENTRE)
         h = np.array(rm["hits"],   dtype=np.int32)
         v = np.array(rm["visits"], dtype=np.int32)
 
-        # Source slice (local grid) and destination slice (global grid)
         sx0 = max(0, -off_px);  sx1 = min(MAP_SIZE, MAP_SIZE - off_px)
         dx0 = max(0,  off_px);  dx1 = min(MAP_SIZE, MAP_SIZE + off_px)
         sy0 = max(0, -off_py);  sy1 = min(MAP_SIZE, MAP_SIZE - off_py)
@@ -355,13 +445,9 @@ def save_map_image(robot_maps, filename="slam_map.png"):
             g_hits  [dy0:dy1, dx0:dx1] += h[sy0:sy1, sx0:sx1]
             g_visits[dy0:dy1, dx0:dx1] += v[sy0:sy1, sx0:sx1]
 
-    # ── Occupancy probability; NaN = never visited ────────────────────
     with np.errstate(divide="ignore", invalid="ignore"):
         occ = np.where(g_visits > 0, g_hits / g_visits, np.nan)
 
-    # ── RGBA image: unexplored=light-grey, free=white, wall=dark-grey ─
-    # LiDAR ray traces are intentionally suppressed: visited free cells
-    # are rendered identical to unvisited free space (plain white).
     img = np.full((MAP_SIZE, MAP_SIZE, 4), [0.93, 0.93, 0.93, 1.0],
                   dtype=np.float32)
     free_mask = (~np.isnan(occ)) & (occ <= WALL_CERTAINTY)
@@ -374,74 +460,130 @@ def save_map_image(robot_maps, filename="slam_map.png"):
     img[wall_mask, 1] = shade
     img[wall_mask, 2] = shade
 
-    # ── Figure ────────────────────────────────────────────────────────
-    fig, ax = plt.subplots(figsize=(8, 7), dpi=150)
+    # Wider figure + legend anchored outside the axes (right column).
+    fig, ax = plt.subplots(figsize=(11, 7), dpi=150)
     ax.imshow(img, origin="upper",
               extent=[-WORLD_X_MAX, WORLD_X_MAX, -WORLD_Y_MAX, WORLD_Y_MAX],
               aspect="equal", interpolation="nearest")
-    ax.set_xlabel("X (m)", fontsize=9)
-    ax.set_ylabel("Y (m)", fontsize=9)
+    ax.set_xlabel("X relative to first finder's start (m)", fontsize=9)
+    ax.set_ylabel("Y relative to first finder's start (m)", fontsize=9)
     n = len(robot_maps)
-    ax.set_title("SLAM Map — %d robot%s" % (n, "s" if n != 1 else ""),
-                 fontsize=11)
+    first_lbl = robot_maps[0].get("label", "first finder")
+    ax.set_title("SLAM Map — stage %d (%d robot%s arrived) · frame: %s"
+                 % (n, n, "s" if n != 1 else "", first_lbl), fontsize=11)
     ax.grid(True, linestyle="--", linewidth=0.4, alpha=0.4, color="#888888")
 
-    # ── Legend base: map-layer patches ───────────────────────────────
     legend_handles = [
-        mpatches.Patch(facecolor=(0.20, 0.20, 0.20),
-                       label="Wall"),
+        mpatches.Patch(facecolor=(0.20, 0.20, 0.20), label="Wall"),
         mpatches.Patch(facecolor=(1.00, 1.00, 1.00),
                        edgecolor="gray", linewidth=0.5, label="Free (explored)"),
         mpatches.Patch(facecolor=(0.93, 0.93, 0.93),
                        edgecolor="gray", linewidth=0.5, label="Unexplored"),
     ]
 
-    # ── Per-robot overlays ────────────────────────────────────────────
-    colors = plt.cm.tab10.colors          # up to 10 visually distinct colors
+    colour_map = {"red": "#d62728", "yellow": "#bcbd22", "green": "#2ca02c"}
 
-    for i, rm in enumerate(robot_maps):
-        c    = colors[i % len(colors)]
-        lbl  = rm.get("label", "Robot %d" % (i + 1))
-        ox, oy = rm["origin"]
-        traj = rm.get("trajectory", [])
-        ppos = rm.get("pinger_pos", None)
+    for rm in robot_maps:
+        lbl  = rm.get("label", "Robot ?")
+        col  = colour_map.get(rm.get("colour", ""), "#1f77b4")
+        sx, sy = rm["start_pos"]
+        sx_r, sy_r = sx - rsx, sy - rsy
+        traj = rm.get("trajectory", [])           # local coords (start = 0,0)
+        ppos = rm.get("pinger_pos", None)         # local coords
 
         if len(traj) > 1:
-            tx, ty = zip(*traj)
-            ax.plot(tx, ty, color=c, linewidth=1.1, alpha=0.85, zorder=3)
+            tx = [p[0] + sx_r for p in traj]
+            ty = [p[1] + sy_r for p in traj]
+            ax.plot(tx, ty, color=col, linewidth=1.1, alpha=0.85, zorder=3)
             legend_handles.append(
-                Line2D([0], [0], color=c, linewidth=1.5,
+                Line2D([0], [0], color=col, linewidth=1.5,
                        label="%s trajectory" % lbl))
 
-        ax.plot(ox, oy, marker="P", color=c, markersize=9,
+        ax.plot(sx_r, sy_r, marker="P", color=col, markersize=9,
                 markeredgecolor="white", markeredgewidth=0.7, zorder=5)
         legend_handles.append(
-            Line2D([0], [0], marker="P", color="w", markerfacecolor=c,
+            Line2D([0], [0], marker="P", color="w", markerfacecolor=col,
                    markersize=8, label="%s start" % lbl))
 
         if ppos is not None:
-            ax.plot(ppos[0], ppos[1], marker="*", color="crimson",
-                    markersize=14, zorder=6,
-                    markeredgecolor="darkred", markeredgewidth=0.5)
+            px, py = ppos[0] + sx_r, ppos[1] + sy_r
+            ax.plot(px, py, marker="*", color=col, markersize=14, zorder=6,
+                    markeredgecolor="black", markeredgewidth=0.5)
             legend_handles.append(
-                Line2D([0], [0], marker="*", color="w",
-                       markerfacecolor="crimson", markersize=10,
-                       label="%s distress signal" % lbl))
+                Line2D([0], [0], marker="*", color="w", markerfacecolor=col,
+                       markersize=10, label="%s person found" % lbl))
 
-    ax.legend(handles=legend_handles, loc="upper left",
-              fontsize=7, framealpha=0.9, edgecolor="gray")
-    fig.tight_layout()
+    # Legend lives in its own column to the right of the map.
+    ax.legend(handles=legend_handles, bbox_to_anchor=(1.02, 1.0),
+              loc="upper left", borderaxespad=0.0,
+              fontsize=8, framealpha=0.95, edgecolor="gray")
+    fig.subplots_adjust(left=0.07, right=0.72, top=0.93, bottom=0.08)
     fig.savefig(filename, dpi=150, bbox_inches="tight")
     plt.close(fig)
-    print("[scout] map saved → " + filename)
+    print("[scout %s] map saved → %s" % (ROBOT_ID, filename))
+
+
+# ═══════════════════════════════════════════════════════════════════
+#  Shared-state I/O — pickle-based handoff between scouts
+# ═══════════════════════════════════════════════════════════════════
+def write_own_state(pinger_local, trajectory, find_time):
+    state = {
+        "id":         ROBOT_ID,
+        "label":      LABEL,
+        "colour":     TARGET_COL,
+        "start_pos":  (START_X, START_Y),   # world translation from world file
+        "hits":       hits,
+        "visits":     visits,
+        "trajectory": list(trajectory),     # LOCAL coords (start = 0,0)
+        "pinger_pos": pinger_local,         # LOCAL coords (start = 0,0)
+        "find_time":  find_time,            # sim seconds since this scout started
+        "wall_time":  time.time(),          # for cross-scout ordering
+    }
+    tmp = OWN_STATE_FILE + ".tmp"
+    with open(tmp, "wb") as f:
+        pickle.dump(state, f, protocol=pickle.HIGHEST_PROTOCOL)
+    os.replace(tmp, OWN_STATE_FILE)
+
+
+def load_all_states():
+    """Return all session-valid state files sorted by arrival (wall_time)."""
+    out = []
+    for path in glob.glob(STATE_GLOB):
+        try:
+            if os.path.getmtime(path) < SESSION_START - 1.0:
+                continue                       # stale from a previous run
+            with open(path, "rb") as f:
+                out.append(pickle.load(f))
+        except (OSError, EOFError, pickle.UnpicklingError):
+            continue
+    out.sort(key=lambda s: s["wall_time"])
+    return out
+
+
+def emit_staged_map(pinger_local, trajectory, find_time):
+    """Write our state, then load every state on disk and render the
+    combined map for the current stage (= number of scouts arrived).
+    The first finder's start translation defines the merged frame."""
+    write_own_state(pinger_local, trajectory, find_time)
+    states = load_all_states()
+    if not states:
+        return
+    ref_start = states[0]["start_pos"]          # first finder = global (0,0)
+    stage     = len(states)
+    fname     = "slam_map_stage%d.png" % stage
+    print("[scout %s] %d/%d scouts arrived — rendering %s"
+          % (ROBOT_ID, stage, 3, fname))
+    save_map_image(states, fname, ref_start)
 
 
 # ═══════════════════════════════════════════════════════════════════
 #  Main loop
 # ═══════════════════════════════════════════════════════════════════
-# Initialise origin from first GPS reading
-_first_step = True
-
+_first_step   = True
+prev_l        = 0.0
+prev_r        = 0.0
+local_x       = 0.0      # odometry-tracked position in this scout's local frame
+local_y       = 0.0
 prev_cell     = (-1, -1)
 step_count    = 0
 ping_received = False
@@ -451,42 +593,48 @@ last_strength = 0.0
 prev_range    = INF
 person_found  = False
 camera_active = False
+reached       = False
 trajectory    = []
-pinger_pix    = None    # pixel coords for the Webots display
-pinger_world  = None    # world coords (wx, wy) for the saved image
+pinger_pix    = None
+pinger_local  = None
 
-print("[scout] online — spiral search until SOS heard")
+print("[scout %s] online — colour=%s — start=(%.2f, %.2f) — spiral search until SOS heard"
+      % (ROBOT_ID, TARGET_COL, START_X, START_Y))
 
 while robot.step(TIME_STEP) != -1:
     step_count += 1
     sim_time    = step_count * TIME_STEP / 1000.0
 
-    vals = gps.getValues()
-    robot_x, robot_y = vals[0], vals[1]
-
-    # Set map origin to robot's starting position
-    if _first_step:
-        origin_x  = robot_x
-        origin_y  = robot_y
-        _first_step = False
-        print("[scout] map origin set to (%.3f, %.3f)" % (origin_x, origin_y))
-
+    # ── Compass: global heading (consistent across scouts → translation-only merge) ──
     compass_vals = compass.getValues()
     heading      = math.atan2(compass_vals[0], compass_vals[1])
 
-    robot_px, robot_py = world_to_pix(robot_x, robot_y)
+    # ── Wheel-encoder odometry: integrate displacement in local frame ──
+    l = left_ps.getValue()
+    r = right_ps.getValue()
+    if _first_step:
+        prev_l, prev_r = l, r
+        _first_step = False
+        print("[scout %s] odometry zeroed — local frame anchored at start"
+              % ROBOT_ID)
+    dl = (l - prev_l) * WHEEL_RADIUS
+    dr = (r - prev_r) * WHEEL_RADIUS
+    prev_l, prev_r = l, r
+    ds = 0.5 * (dl + dr)
+    local_x += ds * math.cos(heading)
+    local_y += ds * math.sin(heading)
+
+    robot_px, robot_py = world_to_pix(local_x, local_y)
     current_cell = (robot_px, robot_py)
     ranges       = lidar.getRangeImage()
 
-    # SLAM
     if current_cell != prev_cell:
         prev_cell = current_cell
-        trajectory.append((robot_x, robot_y))
+        trajectory.append((local_x, local_y))
         if ranges:
-            scan_lidar(robot_x, robot_y, heading, ranges)
+            scan_lidar(local_x, local_y, heading, ranges)
             inflate_obstacles()
 
-    # Radio — polled every step for fresh bearing + range
     r, b, s = read_radio()
     if r < INF:
         prev_range    = last_range
@@ -495,29 +643,40 @@ while robot.step(TIME_STEP) != -1:
         last_strength = s
         if not ping_received:
             ping_received = True
-            print("[scout] SOS heard — engaging radio homing")
-            print("        strength=%.5f | range≈%.2f m | bearing=%+.0f°"
+            print("[scout %s] SOS heard — engaging radio homing" % ROBOT_ID)
+            print("           strength=%.5f | range≈%.2f m | bearing=%+.0f°"
                   % (s, r, math.degrees(b)))
 
-    # Systematic signal updates every 2 sim-seconds while homing
     if ping_received and last_range < INF and step_count % SIGNAL_PRINT_STEPS == 0:
         trend = "closing  ↓" if last_range < prev_range else "moving away ↑"
-        print("[radio] strength=%.5f | range≈%.2f m | bearing=%+.0f° | %s"
-              % (last_strength, last_range, math.degrees(last_bearing), trend))
+        print("[radio %s] strength=%.5f | range≈%.2f m | bearing=%+.0f° | %s"
+              % (ROBOT_ID, last_strength, last_range, math.degrees(last_bearing), trend))
 
-    # Time limit
+    # Already reached — passive: just listen for new states from peers
+    # so the latest stage map keeps being regenerated as they arrive.
+    if reached:
+        left_motor.setVelocity(0.0)
+        right_motor.setVelocity(0.0)
+        if step_count % int(1.0 * 1000 / TIME_STEP) == 0:
+            # Re-render if disk gained a new state since the last render.
+            existing = len(load_all_states())
+            if existing > getattr(emit_staged_map, "_last_stage", 0):
+                states_now = load_all_states()
+                ref_start  = states_now[0]["start_pos"]
+                fname      = "slam_map_stage%d.png" % existing
+                print("[scout %s] peer arrival detected — rendering %s"
+                      % (ROBOT_ID, fname))
+                save_map_image(states_now, fname, ref_start)
+                emit_staged_map._last_stage = existing
+        if sim_time >= SIM_TIME_LIMIT:
+            break
+        continue
+
     if sim_time >= SIM_TIME_LIMIT:
         left_motor.setVelocity(0.0)
         right_motor.setVelocity(0.0)
-        print("[scout] time limit (%.1f s)" % sim_time)
+        print("[scout %s] time limit (%.1f s) — gave up" % (ROBOT_ID, sim_time))
         draw_map(robot_px, robot_py, trajectory, pinger_pix, camera_active)
-        save_map_image([{
-            "hits": hits, "visits": visits,
-            "origin": (origin_x, origin_y),
-            "trajectory": trajectory,
-            "pinger_pos": pinger_world,
-            "label": "Robot 1",
-        }])
         break
 
     # ── Phase 1: spiral search ────────────────────────────────────
@@ -532,40 +691,34 @@ while robot.step(TIME_STEP) != -1:
 
     # ── Phase 2: radio homing ─────────────────────────────────────
 
-    # Proximity stop
     if last_range < RADIO_STOP_DIST:
         left_motor.setVelocity(0.0)
         right_motor.setVelocity(0.0)
         pinger_pix   = (robot_px, robot_py)
-        pinger_world = (robot_x, robot_y)
-        print("[scout] proximity stop — est. %.2f m in %.1f s"
-              % (last_range, sim_time))
+        pinger_local = (local_x, local_y)
+        print("[scout %s] proximity stop — est. %.2f m in %.1f s"
+              % (ROBOT_ID, last_range, sim_time))
         draw_map(robot_px, robot_py, trajectory, pinger_pix, camera_active)
-        save_map_image([{
-            "hits": hits, "visits": visits,
-            "origin": (origin_x, origin_y),
-            "trajectory": trajectory,
-            "pinger_pos": pinger_world,
-            "label": "Robot 1",
-        }])
-        break
+        reached = True
+        emit_staged_map(pinger_local, trajectory, sim_time)
+        emit_staged_map._last_stage = len(load_all_states())
+        continue
 
-    # Camera: activate, preview, scan
     if last_range < CAMERA_DIST:
         if not camera_active:
             camera_active = True
-            print("[camera] activated — robot est. %.2f m from signal source" % last_range)
+            print("[camera %s] activated — robot est. %.2f m from signal source"
+                  % (ROBOT_ID, last_range))
         if not person_found:
-            found, count = scan_for_red()
+            found, count = scan_for_target()
             if step_count % CAM_PRINT_STEPS == 0:
-                print("[camera] %d red pixels detected (threshold: %d)"
-                      % (count, RED_PIXEL_MIN))
+                print("[camera %s] %d %s pixels detected (threshold: %d)"
+                      % (ROBOT_ID, count, TARGET_COL, TARGET_PIXEL_MIN))
             if found:
                 person_found = True
-                print("FOUND PERSON")
+                print("[scout %s] FOUND %s PERSON"
+                      % (ROBOT_ID, TARGET_COL.upper()))
 
-    # Steer toward radio bearing.
-    # Obstacle avoidance suppressed within CAMERA_DIST — the beacon reads as an obstacle.
     lv, rv = steer_to_bearing(last_bearing)
     if last_range > CAMERA_DIST:
         lv, rv = avoid_or(lv, rv, ranges)

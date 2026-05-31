@@ -334,6 +334,20 @@ Once within `CAMERA_DIST`, `scan_for_red()` runs every step and a half-scale pre
  3. **Avoidance is suppressed near the beacon**: within `CAMERA_DIST`, obstacle avoidance is disabled because the beacon's body registers as an obstacle and would cause the robot to veer away. This means the robot approaches the last 0.8 m blind to other obstacles.
 
 
+# Iteration 4 - Bidirectional Dijkstra
+
+ - faz aqui a explicação João 
+
+# Iteration 5 - RescueBot Swarm 
+
+
+## Limitations
+
+ 1. Not tested for when 2 pings are coming from the same space (robot collision and mutual harm)
+ 2. Each robot is only mapped to one channel (maybe after a robot reaches its destination it can try and chase another ping, the one it's closest to, and lock in on that channel after a channel sweep)
+ 3. Efficiency issues might happen: no Dijkstra or mechanism to avoid local minima
+
+
 # How to Run
 
  1. Choose controller method in `arena.wbt`
