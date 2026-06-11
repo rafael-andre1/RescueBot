@@ -1,20 +1,23 @@
 """
-scout — distress-ping rescue robot (radio-homing variant).
+scout — distress-ping rescue robot (multi-robot auction variant).
 
   • No GPS. Pose is dead-reckoned from wheel encoders, with compass for heading.
-  • Goal is unknown — each ping gives a robot-relative bearing + signal strength.
-    Strength → estimated range (~1/sqrt(s)); bearing + heading → world direction.
-    Together they project an estimated goal in the dead-reckoned frame.
+  • Goals are unknown — each beacon pings "SOS <id>" with a robot-relative
+    bearing + signal strength. Strength → estimated range (~1/sqrt(s));
+    bearing + heading → world direction → projected goal estimate.
+  • AUCTION: while idle, the scout bids on every unawarded beacon it hears.
+    Bid = Dijkstra cost over the KNOWN map to the known cell closest to the
+    goal estimate, plus 1.5× straight-line for the unknown remainder.
+    Bids go to the signal manager on channel 2; the manager awards each
+    beacon to the lowest bidder. Awards are BLOCKING — once this scout wins
+    a beacon it is locked to it until physically rescued. No exchange.
   • Path-finding (Dijkstra over the live occupancy grid) routes around walls
-    discovered en route. NO reactive obstacle avoidance, NO spiral search —
-    the planner handles dead-ends because the cost field reflects what we've
-    mapped so far.
+    discovered en route. NO reactive obstacle avoidance, NO spiral search.
 
-Lifecycle: sit still and scan until the first ping; then follow the cost
-gradient toward the estimated goal. Replan when (a) a cell flips state, or
-(b) the bearing-derived goal moves > GOAL_MOVE_THRESH. Arrival is declared
-when signal strength exceeds S_ARRIVE. Map is saved as slam_map.png on
-arrival or expiry.
+Lifecycle: idle (sit, scan, bid) → win a beacon → home in on its pings via
+the cost gradient → beacon silenced by the manager when reached → back to
+idle. On "DONE" from the manager (or prolonged radio silence) the map is
+saved as slam_map_<id>.png and the controller exits.
 """
 from controller import Robot
 import math
@@ -50,20 +53,24 @@ IMPASSABLE_COST  = 1000
 
 #  Radio homing
 GOAL_MOVE_THRESH = 0.20         # re-plan when bearing-derived goal moves > this (m)
-S_ARRIVE         = 6.25         # signal strength threshold → declare arrival.
-                                # Webots emitter: strength = 1/d². So:
-                                #   d = 1/sqrt(s)   →   s = 1/d²
-                                #   d = 0.40 m → s = 6.25
-                                #   d = 0.30 m → s = 11.1
-                                #   d = 0.20 m → s = 25.0
-                                # Keep this aligned with signal_controller's
-                                # RESCUE_RADIUS so scout + signal trigger at the
-                                # same distance.
 
-#  Continuous rescue
-MAX_RESCUES        = 5        # stop after this many help requests handled
-SILENCE_TIMEOUT    = 5.0      # if no HELP ping for this long after the first
-                              # was heard, assume the mission ended and save
+#  Auction (channel 2; the signal manager is the auctioneer)
+REBID_PERIOD       = 1.0      # while idle, refresh bids this often (s)
+BID_UNKNOWN_FACTOR = 1.5      # cost multiplier for the unknown remainder of a bid
+BEACON_SILENT_T    = 1.0      # my beacon silent this long → it was rescued (the
+                              # manager removes the beacon node at RESCUE_RADIUS,
+                              # so silence == arrival; no strength threshold needed)
+SILENCE_TIMEOUT    = 8.0      # idle + no SOS at all for this long after the first
+                              # ping ever → assume mission over, save map and exit
+
+#  Robot-robot avoidance (peer heartbeats shared on channel 2)
+ROBOT_FLAG         = 2        # value stamped into robot_occ for peer-occupied cells
+ROBOT_AVOID_DIST   = 0.35     # peer closer than this, moving, higher priority → I stop
+ROBOT_RELEASE_DIST = 0.55     # resume once that peer is farther than this (hysteresis)
+ROBOT_MARK_DIST    = 0.70     # peers closer than this get stamped into the grid
+ROBOT_MARK_CELLS   = 4        # half-width of the block stamped around a peer (cells)
+PEER_FRESH         = 0.5      # peer data older than this is ignored (s)
+AVOID_REPLAN_MIN   = 0.5      # min seconds between mark-triggered replans
 
 #  Display
 DRAW_INTERVAL    = 16
@@ -80,6 +87,13 @@ NEIGHBOURS = [(-1, -1, DIAG), (-1, 0, STRAIGHT), (-1, 1, DIAG),
 #  Webots device setup
 # ═══════════════════════════════════════════════════════════════════
 robot = Robot()
+
+# Identity: spawned by the manager as "scout_<id>"
+ROBOT_NAME = robot.getName()
+try:
+    ROBOT_ID = int(ROBOT_NAME.split("_")[-1])
+except ValueError:
+    ROBOT_ID = 0
 
 left_motor  = robot.getDevice("left wheel motor")
 right_motor = robot.getDevice("right wheel motor")
@@ -102,8 +116,14 @@ LIDAR_FOV = lidar.getFov()   # Webots scanline: index 0 at +FOV/2, angle decreas
 camera   = robot.getDevice("camera")
 camera.enable(TIME_STEP)
 
-receiver = robot.getDevice("receiver")
+receiver = robot.getDevice("receiver")          # channel 1 — beacon SOS pings
 receiver.enable(TIME_STEP)
+
+# Auction bus (channel 2): built-in emitter sends bids, extra receiver
+# hears AWARD/DONE from the manager (and other scouts' bids, ignored).
+auction_tx = robot.getDevice("emitter")
+auction_rx = robot.getDevice("auction_receiver")
+auction_rx.enable(TIME_STEP)
 
 compass  = robot.getDevice("compass")
 compass.enable(TIME_STEP)
@@ -242,6 +262,38 @@ def inflate_obstacles():
 
 
 # ═══════════════════════════════════════════════════════════════════
+#  Robot flag layer — peers stamped into the grid as ROBOT_FLAG (2)
+#  Separate from walls: transient, cleared/re-stamped as peers move.
+#  The planner treats flagged cells as blocked, so the path naturally
+#  goes AROUND a stopped peer robot.
+# ═══════════════════════════════════════════════════════════════════
+robot_occ   = [[0] * MAP_SIZE for _ in range(MAP_SIZE)]
+robot_marks = set()
+
+
+def stamp_robot_marks(positions):
+    """Stamp a block of ROBOT_FLAG cells around each peer position.
+    positions: list of (wx, wy). Returns True if the marked set changed."""
+    global robot_marks
+    new_marks = set()
+    for (wx, wy) in positions:
+        cpx, cpy = world_to_pix(wx, wy)
+        for dy in range(-ROBOT_MARK_CELLS, ROBOT_MARK_CELLS + 1):
+            for dx in range(-ROBOT_MARK_CELLS, ROBOT_MARK_CELLS + 1):
+                nx, ny = cpx + dx, cpy + dy
+                if 0 <= nx < MAP_SIZE and 0 <= ny < MAP_SIZE:
+                    new_marks.add((nx, ny))
+    if new_marks == robot_marks:
+        return False
+    for (x, y) in robot_marks:
+        robot_occ[y][x] = 0
+    for (x, y) in new_marks:
+        robot_occ[y][x] = ROBOT_FLAG
+    robot_marks = new_marks
+    return True
+
+
+# ═══════════════════════════════════════════════════════════════════
 #  MATRIX 2 — bidirectional Dijkstra path from robot to goal
 #  The cost matrix is no longer a full flood-fill; BD explores roughly
 #  half the area of unidirectional Dijkstra, then we write the resulting
@@ -253,14 +305,16 @@ cost = [[INF] * MAP_SIZE for _ in range(MAP_SIZE)]
 
 def _snap_to_free(px, py, radius):
     """If (px,py) is blocked, return the nearest free cell within radius, else (px,py)."""
-    if inflated[py][px] == 0 and get_cell_cost(px, py) < IMPASSABLE_COST:
+    if (inflated[py][px] == 0 and robot_occ[py][px] == 0
+            and get_cell_cost(px, py) < IMPASSABLE_COST):
         return px, py
     best, best_d = None, INF
     for dy in range(-radius, radius + 1):
         for dx in range(-radius, radius + 1):
             nx, ny = px + dx, py + dy
             if 0 <= nx < MAP_SIZE and 0 <= ny < MAP_SIZE:
-                if inflated[ny][nx] == 0 and get_cell_cost(nx, ny) < IMPASSABLE_COST:
+                if (inflated[ny][nx] == 0 and robot_occ[ny][nx] == 0
+                        and get_cell_cost(nx, ny) < IMPASSABLE_COST):
                     d = abs(dx) + abs(dy)
                     if d < best_d:
                         best_d = d
@@ -306,7 +360,7 @@ def bidirectional_dijkstra(start, goal):
                 nx, ny = ux + dx, uy + dy
                 if not (0 <= nx < MAP_SIZE and 0 <= ny < MAP_SIZE):
                     continue
-                if inflated[ny][nx] == 1:
+                if inflated[ny][nx] == 1 or robot_occ[ny][nx] != 0:
                     continue
                 cc = get_cell_cost(nx, ny)
                 if cc >= IMPASSABLE_COST:
@@ -331,7 +385,7 @@ def bidirectional_dijkstra(start, goal):
                 nx, ny = ux + dx, uy + dy
                 if not (0 <= nx < MAP_SIZE and 0 <= ny < MAP_SIZE):
                     continue
-                if inflated[ny][nx] == 1:
+                if inflated[ny][nx] == 1 or robot_occ[ny][nx] != 0:
                     continue
                 if get_cell_cost(nx, ny) >= IMPASSABLE_COST:
                     continue
@@ -398,26 +452,80 @@ def replan():
 # ═══════════════════════════════════════════════════════════════════
 #  Radio homing — turn the strongest "HELP" ping into a world-frame goal
 # ═══════════════════════════════════════════════════════════════════
-def estimate_goal_from_radio(robot_x, robot_y, heading):
-    """Drain the receiver queue, return (gx, gy, strength) for the strongest
-    HELP packet, or None if nothing was heard this step."""
-    best_s, best_b = -1.0, 0.0
+def read_sos_packets():
+    """Drain the SOS receiver (channel 1). Returns {beacon_id: (strength,
+    bearing_rel)} keeping the strongest packet per beacon this step."""
+    packets = {}
     while receiver.getQueueLength() > 0:
-        msg = receiver.getString()
-        if "SOS" in msg or "HELP" in msg:        # accept either keyword
-            s = receiver.getSignalStrength()
-            d = receiver.getEmitterDirection()
-            b = math.atan2(d[1], d[0])           # robot-relative bearing
-            if s > best_s:
-                best_s, best_b = s, b
+        try:
+            msg = receiver.getString()
+            parts = msg.split()
+            if parts and parts[0] == "SOS":
+                bid_id = int(parts[1]) if len(parts) > 1 else 0
+                s = receiver.getSignalStrength()
+                d = receiver.getEmitterDirection()
+                b = math.atan2(d[1], d[0])       # robot-relative bearing
+                if bid_id not in packets or s > packets[bid_id][0]:
+                    packets[bid_id] = (s, b)
+        except (ValueError, UnicodeDecodeError):
+            pass
         receiver.nextPacket()
-    if best_s <= 0:
-        return None
-    rng = 1.0 / math.sqrt(best_s)                # Webots default ~1/d² emission
-    world_b = heading + best_b
+    return packets
+
+
+def project_goal(robot_x, robot_y, heading, strength, bearing_rel):
+    """Strength + bearing → estimated goal position in this scout's frame."""
+    rng = 1.0 / math.sqrt(strength)              # Webots default ~1/d² emission
+    world_b = heading + bearing_rel
     return (robot_x + rng * math.cos(world_b),
-            robot_y + rng * math.sin(world_b),
-            best_s)
+            robot_y + rng * math.sin(world_b))
+
+
+# ═══════════════════════════════════════════════════════════════════
+#  Auction bid — theoretical cost to a goal estimate
+#  Dijkstra over the KNOWN map only (cells we've actually seen), then
+#  from the known cell closest to the goal, infer the unknown remainder
+#  as straight-line distance at BID_UNKNOWN_FACTOR (1.5×) cost.
+# ═══════════════════════════════════════════════════════════════════
+def known_flood(rpx, rpy):
+    """Dijkstra from the robot's cell over KNOWN free cells (visits > 0,
+    not wall, not inflated). Returns {(x, y): path_cost}."""
+    dist = {(rpx, rpy): 0.0}
+    pq = [(0.0, rpx, rpy)]
+    while pq:
+        c, cx, cy = heapq.heappop(pq)
+        if c > dist.get((cx, cy), INF):
+            continue
+        for dx, dy, md in NEIGHBOURS:
+            nx, ny = cx + dx, cy + dy
+            if not (0 <= nx < MAP_SIZE and 0 <= ny < MAP_SIZE):
+                continue
+            if visits[ny][nx] == 0:              # unknown — not part of known map
+                continue
+            if is_wall(nx, ny) or inflated[ny][nx] == 1 or robot_occ[ny][nx] != 0:
+                continue
+            cc = get_cell_cost(nx, ny)
+            if cc >= IMPASSABLE_COST:
+                continue
+            nc = c + md * cc
+            if nc < dist.get((nx, ny), INF):
+                dist[(nx, ny)] = nc
+                heapq.heappush(pq, (nc, nx, ny))
+    return dist
+
+
+def bid_for_goal(flood, gwx, gwy):
+    """Bid = min over known cells of (path cost there + 1.5 × straight-line
+    remainder to the goal estimate), in cell units. The robot's own cell is
+    in the flood with cost 0, so 'no known path helps' is covered too."""
+    gpx, gpy = world_to_pix(gwx, gwy)
+    best = INF
+    for (cx, cy), c in flood.items():
+        rem = math.hypot(cx - gpx, cy - gpy)
+        tot = c + BID_UNKNOWN_FACTOR * rem
+        if tot < best:
+            best = tot
+    return best
 
 
 # ═══════════════════════════════════════════════════════════════════
@@ -696,6 +804,8 @@ def draw_map(robot_px, robot_py, goal_px, goal_py,
             elif occ > WALL_CERTAINTY:
                 t = (occ - WALL_CERTAINTY) / (IMPASSABLE - WALL_CERTAINTY)
                 display.setColor((int(180 + 75 * t) << 16) | (int(120 * (1.0 - t)) << 8))
+            elif robot_occ[y][x] != 0:
+                display.setColor(0xCC44CC)       # peer robot flag (transient)
             elif inflated[y][x] == 1:
                 display.setColor(0x444444)
             elif visits[y][x] > 0:
@@ -726,19 +836,31 @@ one its close to the goal mesured from the signal strengh he arrived
 """
 prev_cell     = (-1, -1)
 step_count    = 0
-ping_received = False
-goal_x, goal_y = 0.0, 0.0          # placeholder; set on first ping
+goal_x, goal_y = 0.0, 0.0          # placeholder; set when my beacon is heard
 robot_x, robot_y = 0.0, 0.0        # dead-reckoned pose, map origin = start
 prev_left_enc  = None              # initialised on first iteration
 prev_right_enc = None
-rescues_completed  = 0             # how many help requests handled so far
+rescues_completed  = 0             # how many beacons this scout rescued
 origin_x, origin_y = 0.0, 0.0      # dead-reckoned frame origin (always 0,0 here)
 trajectory         = []            # list of (wx, wy) — robot path for the map
 rescued_positions  = []            # list of (wx, wy) — where each rescue happened
-last_ping_time     = 0.0           # sim_time of the most recent HELP packet
-any_ping_ever      = False         # have we heard at least one HELP yet?
+last_ping_time     = 0.0           # sim_time of the most recent SOS packet (any beacon)
+any_ping_ever      = False         # have we heard at least one SOS yet?
 
-print("[scout] online — sitting still until first HELP ping")
+# Auction state
+assigned_id   = None               # beacon id this scout is locked to (None = idle)
+have_goal     = False              # first estimate of my beacon received?
+taken         = set()              # beacon ids awarded to anyone (incl. me)
+last_rebid    = -1e9               # sim_time of last bid broadcast
+my_last_ping  = 0.0                # sim_time my assigned beacon was last heard
+done_received = False              # manager said the mission is over
+
+# Peer-avoidance state
+peers             = {}             # id → {pos, range, state, t}
+yielding_to       = None           # peer id I'm stopped for (None = driving freely)
+last_marks_replan = -1e9           # throttle mark-triggered replans
+
+print("[scout %d] online — idle, listening for SOS to bid on" % ROBOT_ID)
 
 while robot.step(TIME_STEP) != -1:
     step_count += 1
@@ -775,61 +897,99 @@ while robot.step(TIME_STEP) != -1:
         if ranges:
             state_changed = scan_lidar(robot_x, robot_y, heading, ranges)
         # Replan if (a) a cell flipped state, or (b) we've drifted off the BD path
-        if ping_received and (state_changed or cost[robot_py][robot_px] == INF):
+        if have_goal and (state_changed or cost[robot_py][robot_px] == INF):
             replan()
             map_changed = True
 
-    # ── Radio: derive an estimated goal in world frame ──────────────
-    # Every rescue runs the same loop: wait for a HELP ping → home in on
-    # the strongest signal → arrive → reset to wait. (estimate_goal_from_radio
-    # already picks the strongest packet, so a future multi-pinger world
-    # works without changes here.)
-    est = estimate_goal_from_radio(robot_x, robot_y, heading)
-    if est is not None:
-        gx, gy, strength = est
-        last_ping_time = sim_time
+    # ── Radio: per-beacon SOS packets (channel 1) ────────────────────
+    packets = read_sos_packets()
+    if packets:
         any_ping_ever  = True
+        last_ping_time = sim_time
 
-        # Arrival: same logic for every rescue (>= so we don't miss the boundary
-        # where signal_controller advances at d=0.40 m exactly).
-        if ping_received and strength >= S_ARRIVE:
-            rescues_completed += 1
-            rescued_positions.append((robot_x, robot_y))    # for the saved map
-            print("[scout] rescue #%d reached (strength=%.4f, t=%.1f s)"
-                  % (rescues_completed, strength, sim_time))
-            left_motor.setVelocity(0.0)
-            right_motor.setVelocity(0.0)
-            if rescues_completed >= MAX_RESCUES:
-                draw_map(robot_px, robot_py, goal_px, goal_py)
-                save_map_image([{
-                    "hits": hits, "visits": visits,
-                    "origin": (origin_x, origin_y),
-                    "trajectory": trajectory,
-                    "pinger_positions": rescued_positions,
-                    "label": "Scout",
-                }])
-                break
-            # Reset to wait-for-ping. Occupancy survives; cost matrix will
-            # be regenerated by replan() when the next HELP arrives.
-            ping_received = False
-            goal_x, goal_y = 0.0, 0.0
-            print("[scout] waiting for next HELP request ...")
+    # ── Heartbeat: tell the other scouts where I am and if I'm moving ─
+    my_state = 1 if (assigned_id is not None and have_goal
+                     and yielding_to is None) else 0
+    auction_tx.send(("POS %d %d" % (ROBOT_ID, my_state)).encode("utf-8"))
 
-        # Update real-radio goal on first ping or significant move
-        elif (not ping_received
-                or math.hypot(gx - goal_x, gy - goal_y) > GOAL_MOVE_THRESH):
-            goal_x, goal_y = gx, gy
-            if not ping_received:
-                ping_received = True
-                print("[scout] HELP received — engaging gradient navigation")
+    # ── Auction bus (channel 2): AWARD / DONE / peer POS heartbeats ──
+    while auction_rx.getQueueLength() > 0:
+        try:
+            parts = auction_rx.getString().split()
+            if parts and parts[0] == "AWARD" and len(parts) == 3:
+                b, r = int(parts[1]), int(parts[2])
+                taken.add(b)
+                if r == ROBOT_ID:
+                    assigned_id  = b
+                    have_goal    = False
+                    my_last_ping = sim_time
+                    print("[scout %d] WON beacon %d — locked until rescued"
+                          % (ROBOT_ID, b))
+            elif parts and parts[0] == "POS" and len(parts) == 3:
+                pid, pstate = int(parts[1]), int(parts[2])
+                if pid != ROBOT_ID:
+                    s = auction_rx.getSignalStrength()
+                    d = auction_rx.getEmitterDirection()
+                    if s > 0:
+                        rng  = 1.0 / math.sqrt(s)
+                        brg  = math.atan2(d[1], d[0])
+                        wb   = heading + brg
+                        peers[pid] = {
+                            "pos":   (robot_x + rng * math.cos(wb),
+                                      robot_y + rng * math.sin(wb)),
+                            "range": rng,
+                            "state": pstate,
+                            "t":     sim_time,
+                        }
+            elif parts and parts[0] == "DONE":
+                done_received = True
+        except (ValueError, UnicodeDecodeError):
+            pass
+        auction_rx.nextPacket()
+
+    # ── Peer avoidance ───────────────────────────────────────────────
+    # Rule: in a close encounter only ONE robot moves. Priority = lower id
+    # (an idle/stopped peer never has priority — it's already standing still).
+    # The yielding robot freezes; the moving robot stamps the frozen peer
+    # into the grid (robot_occ = 2) and its planner routes AROUND it.
+    if assigned_id is not None and have_goal:
+        if yielding_to is None:
+            for pid, p in peers.items():
+                if (sim_time - p["t"] < PEER_FRESH and p["state"] == 1
+                        and pid < ROBOT_ID and p["range"] < ROBOT_AVOID_DIST):
+                    yielding_to = pid
+                    print("[scout %d] yielding to scout %d (%.2f m)"
+                          % (ROBOT_ID, pid, p["range"]))
+                    break
+        else:
+            p = peers.get(yielding_to)
+            if (p is None or sim_time - p["t"] > 2.0 * PEER_FRESH
+                    or p["state"] != 1 or p["range"] > ROBOT_RELEASE_DIST):
+                print("[scout %d] resuming (scout %s cleared)"
+                      % (ROBOT_ID, yielding_to))
+                yielding_to = None
+    else:
+        yielding_to = None
+
+    # Stamp nearby peers I must route around: stopped ones, or lower-priority
+    # movers (they will yield to me). Never stamp a peer I'm yielding to —
+    # I'm standing still anyway and it would poison my map while it passes.
+    mark_positions = [p["pos"] for pid, p in peers.items()
+                      if sim_time - p["t"] < PEER_FRESH
+                      and pid != yielding_to
+                      and p["range"] < ROBOT_MARK_DIST
+                      and (pid > ROBOT_ID or p["state"] == 0)]
+    if stamp_robot_marks(mark_positions):
+        if have_goal and sim_time - last_marks_replan > AVOID_REPLAN_MIN:
             replan()
             map_changed = True
-            goal_px, goal_py = world_to_pix(goal_x, goal_y)
+            last_marks_replan = sim_time
 
-    # ── End-of-mission: signal stopped emitting → save and exit ─────
-    if any_ping_ever and (sim_time - last_ping_time) > SILENCE_TIMEOUT:
-        print("[scout] no HELP for %.1f s — mission complete (%d rescue%s)"
-              % (SILENCE_TIMEOUT, rescues_completed,
+    # ── End-of-mission: manager said DONE, or radio went dead ───────
+    if done_received or (any_ping_ever and assigned_id is None
+                         and (sim_time - last_ping_time) > SILENCE_TIMEOUT):
+        print("[scout %d] mission complete — %d rescue%s"
+              % (ROBOT_ID, rescues_completed,
                  "s" if rescues_completed != 1 else ""))
         left_motor.setVelocity(0.0)
         right_motor.setVelocity(0.0)
@@ -839,24 +999,69 @@ while robot.step(TIME_STEP) != -1:
             "origin": (origin_x, origin_y),
             "trajectory": trajectory,
             "pinger_positions": rescued_positions,
-            "label": "Scout",
-        }])
+            "label": "Scout %d" % ROBOT_ID,
+        }], filename="slam_map_%d.png" % ROBOT_ID)
         break
 
-    # ── Phase 1: no ping yet → sit still and scan ───────────────────
-    if not ping_received:
-        left_motor.setVelocity(0.0)
-        right_motor.setVelocity(0.0)
-        if map_changed or step_count % DRAW_INTERVAL == 0:
-            draw_map(robot_px, robot_py, goal_px, goal_py)
+    # ── ASSIGNED: home in on my beacon only ─────────────────────────
+    if assigned_id is not None:
+        if assigned_id in packets:
+            my_last_ping = sim_time
+            s, b = packets[assigned_id]
+            gx, gy = project_goal(robot_x, robot_y, heading, s, b)
+            if (not have_goal
+                    or math.hypot(gx - goal_x, gy - goal_y) > GOAL_MOVE_THRESH):
+                goal_x, goal_y = gx, gy
+                have_goal = True
+                replan()
+                map_changed = True
+                goal_px, goal_py = world_to_pix(goal_x, goal_y)
+
+        elif sim_time - my_last_ping > BEACON_SILENT_T:
+            # My beacon went silent → the manager removed it → rescued.
+            rescues_completed += 1
+            rescued_positions.append((robot_x, robot_y))
+            print("[scout %d] beacon %d rescued (#%d for me, t=%.1f s) — back to idle"
+                  % (ROBOT_ID, assigned_id, rescues_completed, sim_time))
+            assigned_id = None
+            have_goal   = False
+            goal_x, goal_y = 0.0, 0.0
+            left_motor.setVelocity(0.0)
+            right_motor.setVelocity(0.0)
+
+        if assigned_id is not None and have_goal and yielding_to is None:
+            # Drive: pure gradient descent (walls AND stamped peers avoided
+            # by the planner itself)
+            lookahead_px, lookahead_py = follow_gradient(robot_px, robot_py, heading)
+            lookahead_wx, lookahead_wy = pix_to_world(lookahead_px, lookahead_py)
+            lv, rv = steer_to(robot_x, robot_y, heading, lookahead_wx, lookahead_wy)
+            left_motor.setVelocity(lv)
+            right_motor.setVelocity(rv)
+            if map_changed or step_count % DRAW_INTERVAL == 0:
+                draw_map(robot_px, robot_py, goal_px, goal_py,
+                         lookahead_px, lookahead_py)
+        else:
+            # Yielding to a higher-priority scout, or no packet from my
+            # beacon yet → hold position
+            left_motor.setVelocity(0.0)
+            right_motor.setVelocity(0.0)
         continue
 
-    # ── Phase 2: pure gradient descent (reactive override disabled) ─
-    lookahead_px, lookahead_py = follow_gradient(robot_px, robot_py, heading)
-    lookahead_wx, lookahead_wy = pix_to_world(lookahead_px, lookahead_py)
-    lv, rv = steer_to(robot_x, robot_y, heading, lookahead_wx, lookahead_wy)
-    left_motor.setVelocity(lv)
-    right_motor.setVelocity(rv)
+    # ── IDLE: sit still, scan, and bid on unawarded beacons ─────────
+    left_motor.setVelocity(0.0)
+    right_motor.setVelocity(0.0)
+
+    candidates = [b for b in packets if b not in taken]
+    if candidates and sim_time - last_rebid >= REBID_PERIOD:
+        last_rebid = sim_time
+        flood = known_flood(robot_px, robot_py)   # one flood serves all bids
+        for b in candidates:
+            s, brg = packets[b]
+            gx, gy = project_goal(robot_x, robot_y, heading, s, brg)
+            cost_bid = bid_for_goal(flood, gx, gy)
+            if cost_bid < INF:
+                auction_tx.send(("BID %d %d %.3f"
+                                 % (b, ROBOT_ID, cost_bid)).encode("utf-8"))
 
     if map_changed or step_count % DRAW_INTERVAL == 0:
-        draw_map(robot_px, robot_py, goal_px, goal_py, lookahead_px, lookahead_py)
+        draw_map(robot_px, robot_py, goal_px, goal_py)

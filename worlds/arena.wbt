@@ -2,7 +2,7 @@
 EXTERNPROTO "https://raw.githubusercontent.com/cyberbotics/webots/R2025a/projects/objects/backgrounds/protos/TexturedBackground.proto"
 EXTERNPROTO "https://raw.githubusercontent.com/cyberbotics/webots/R2025a/projects/objects/backgrounds/protos/TexturedBackgroundLight.proto"
 EXTERNPROTO "https://raw.githubusercontent.com/cyberbotics/webots/R2025a/projects/objects/floors/protos/Floor.proto"
-EXTERNPROTO "https://raw.githubusercontent.com/cyberbotics/webots/R2025a/projects/robots/gctronic/e-puck/protos/E-puck.proto"
+IMPORTABLE EXTERNPROTO "https://raw.githubusercontent.com/cyberbotics/webots/R2025a/projects/robots/gctronic/e-puck/protos/E-puck.proto"
 
 WorldInfo {
 }
@@ -144,56 +144,19 @@ Solid {
   }
 }
 
-E-puck {
-  translation 0 0 0
-  rotation 0 0 1 0
-  name "scout"
-  controller "robot_controller"
-  receiver_channel 1
-  camera_fieldOfView 1.047
-  camera_width 128
-  camera_height 96
-  turretSlot [
-    Lidar {
-      translation 0 0 0.02
-      horizontalResolution 360
-      fieldOfView 6.283185
-      numberOfLayers 1
-      maxRange 5
-    }
-    Display {
-      name "map_display"
-      width 400
-      height 400
-    }
-    GPS {
-      name "gps"
-    }
-    Compass {
-      name "compass"
-    }
-  ]
-}
 Robot {
-  translation 3 -2 0.05
-  children [
-    Shape {
-      appearance PBRAppearance {
-        baseColor 1 0 0
-        emissiveColor 1 0 0
-        roughness 0.2
-        metalness 0
-      }
-      geometry Box {
-        size 0.15 0.15 0.1
-      }
-    }
-    Emitter {
-      name "emitter"
-      channel 1
-    }
-  ]
-  name "pinger"
+  translation 0 0 0
+  name "signal_manager"
   controller "signal_controller"
   supervisor TRUE
+  children [
+    Emitter {
+      name "auction_emitter"
+      channel 2
+    }
+    Receiver {
+      name "auction_receiver"
+      channel 2
+    }
+  ]
 }
