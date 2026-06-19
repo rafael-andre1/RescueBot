@@ -529,6 +529,67 @@ def bid_for_goal(flood, gwx, gwy):
 
 
 # ═══════════════════════════════════════════════════════════════════
+#  Line-of-Sight & Lookahead Target (Path Smoothing)
+# ═══════════════════════════════════════════════════════════════════
+def has_line_of_sight(x0, y0, x1, y1):
+    """
+    Check if there is a clear line of sight between two points
+    (no obstacles or unknown areas).
+    """
+    for cx, cy in bresenham(x0, y0, x1, y1):
+        if not (0 <= cx < MAP_SIZE and 0 <= cy < MAP_SIZE):
+            return False
+        # If unexplored, wall, inflated obstacle, or another robot
+        if visits[cy][cx] == 0 or is_wall(cx, cy) or inflated[cy][cx] == 1 or robot_occ[cy][cx] != 0:
+            return False
+    return True
+
+
+def get_lookahead_target(rpx, rpy, heading):
+    """
+    Finds the furthest point on the path (following the lowest cost)
+    that still has a direct line of sight from the robot.
+    """
+    target_px, target_py = follow_gradient(rpx, rpy, heading)
+    if (target_px, target_py) == (rpx, rpy):
+        return rpx, rpy
+
+    current_px, current_py = target_px, target_py
+    MAX_LOOKAHEAD = 20  # Maximum number of cells to predict ahead
+
+    for _ in range(MAX_LOOKAHEAD):
+        min_c = INF
+        next_px, next_py = current_px, current_py
+
+        # Look for the neighbor with the lowest cost
+        for dy in (-1, 0, 1):
+            for dx in (-1, 0, 1):
+                if dx == 0 and dy == 0:
+                    continue
+                nx, ny = current_px + dx, current_py + dy
+                if 0 <= nx < MAP_SIZE and 0 <= ny < MAP_SIZE:
+                    c = cost[ny][nx]
+                    if c < min_c:
+                        min_c = c
+                        next_px, next_py = nx, ny
+
+        # Stop if we hit a local minimum or the goal
+        if min_c >= cost[current_py][current_px]:
+            break
+
+        current_px, current_py = next_px, next_py
+
+        # Check if we still have a straight line of sight to this new point
+        if has_line_of_sight(rpx, rpy, current_px, current_py):
+            target_px, target_py = current_px, current_py
+        else:
+            # Obstacle broke the line of sight; use the last valid target
+            break
+
+    return target_px, target_py
+
+
+# ═══════════════════════════════════════════════════════════════════
 #  Gradient follower — trace several cells ahead
 # ═══════════════════════════════════════════════════════════════════
 def follow_gradient(rpx, rpy, heading):
@@ -1030,9 +1091,9 @@ while robot.step(TIME_STEP) != -1:
             right_motor.setVelocity(0.0)
 
         if assigned_id is not None and have_goal and yielding_to is None:
-            # Drive: pure gradient descent (walls AND stamped peers avoided
-            # by the planner itself)
-            lookahead_px, lookahead_py = follow_gradient(robot_px, robot_py, heading)
+            # Drive: gradient descent with Line-of-Sight lookahead
+            # (walls AND stamped peers avoided by the planner itself)
+            lookahead_px, lookahead_py = get_lookahead_target(robot_px, robot_py, heading)
             lookahead_wx, lookahead_wy = pix_to_world(lookahead_px, lookahead_py)
             lv, rv = steer_to(robot_x, robot_y, heading, lookahead_wx, lookahead_wy)
             left_motor.setVelocity(lv)
