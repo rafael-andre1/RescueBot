@@ -83,30 +83,84 @@ print("[manager] spawned %d scouts clustered at centre (r=%.2f m)"
       % (NUM_ROBOTS, CLUSTER_RADIUS))
 
 # ─── Beacon spawning ─────────────────────────────────────────────────
+# Colour options for beacons — picked at random on spawn
+BEACON_COLOURS = {
+    "red":    (1.0, 0.0, 0.0),
+    "yellow": (1.0, 1.0, 0.0),
+    "green":  (0.0, 1.0, 0.0),
+}
+COLOUR_NAMES = list(BEACON_COLOURS.keys())
+
 BEACON_TEMPLATE = (
     'DEF BEACON_%d Robot { '
     'translation %.3f %.3f 0.05 '
     'name "beacon_%d" controller "beacon_controller" '
     'children [ '
-    'Shape { appearance PBRAppearance { baseColor 1 0 0 emissiveColor 1 0 0 '
+    'Shape { appearance PBRAppearance { baseColor %.1f %.1f %.1f emissiveColor %.1f %.1f %.1f '
     'roughness 0.2 metalness 0 } geometry Box { size 0.15 0.15 0.1 } } '
     'Emitter { channel 1 } '
     '] }'
 )
 
-beacon_pos    = {}           # id → (x, y)
-beacon_node   = {}           # id → supervisor node ref
-beacon_spawn_t = {}          # id → sim time it appeared
-assigned      = {}           # beacon id → robot id (locked, never changes)
-rescued       = set()        # beacon ids rescued
-busy_robots   = set()        # robot ids currently locked to a beacon
-bids          = {}           # (beacon, robot) → (cost, t_received)
+beacon_pos     = {}           # id → (x, y)
+beacon_node    = {}           # id → supervisor node ref
+beacon_spawn_t = {}           # id → sim time it appeared
+beacon_colour  = {}           # id → colour name ("red", "yellow", "green")
+assigned       = {}           # beacon id → robot id (locked, never changes)
+rescued        = set()        # beacon ids rescued
+busy_robots    = set()        # robot ids currently locked to a beacon
+bids           = {}           # (beacon, robot) → (cost, t_received)
+# Wall rectangles from arena.wbt: (centre_x, centre_y, half_w, half_h)
+# with a safety margin so beacons don't spawn too close to walls.
+WALL_MARGIN = 0.30   # extra clearance around each wall (m)
+WALLS = [
+    # wall_1: vertical at (1.5, 0), Box 0.05×2
+    (1.5,   0.0,   0.05/2 + WALL_MARGIN, 2.0/2 + WALL_MARGIN),
+    # wall_2: horizontal at (-1.5, -1), Box 2×0.05
+    (-1.5, -1.0,   2.0/2 + WALL_MARGIN,  0.05/2 + WALL_MARGIN),
+    # wall_3: horizontal at (0, 2), Box 1.5×0.05
+    (0.0,   2.0,   1.5/2 + WALL_MARGIN,  0.05/2 + WALL_MARGIN),
+    # wall_4: vertical at (-2, 0.5), Box 0.05×2
+    (-2.0,  0.5,   0.05/2 + WALL_MARGIN, 2.0/2 + WALL_MARGIN),
+    # wall_5: horizontal at (2, -1.5), Box 2×0.05
+    (2.0,  -1.5,   2.0/2 + WALL_MARGIN,  0.05/2 + WALL_MARGIN),
+    # wall_6: vertical at (2.5, 1.25), Box 0.05×2
+    (2.5,   1.25,  0.05/2 + WALL_MARGIN, 2.0/2 + WALL_MARGIN),
+    # wall_7: horizontal at (-1, 1), Box 1×0.05
+    (-1.0,  1.0,   1.0/2 + WALL_MARGIN,  0.05/2 + WALL_MARGIN),
+]
 
-positions = [(random.uniform(*X_RANGE), random.uniform(*Y_RANGE))
-             for _ in range(NUM_GOALS)]
+
+def _position_clear(x, y):
+    """True if (x, y) doesn't overlap any wall rectangle (with margin)."""
+    for wx, wy, hw, hh in WALLS:
+        if abs(x - wx) < hw and abs(y - wy) < hh:
+            return False
+    return True
+
+
+def _safe_position():
+    """Generate a random position that doesn't overlap with any wall."""
+    for _ in range(200):
+        x = random.uniform(*X_RANGE)
+        y = random.uniform(*Y_RANGE)
+        if _position_clear(x, y):
+            return x, y
+    return random.uniform(*X_RANGE), random.uniform(*Y_RANGE)  # fallback
+
+
+positions = [_safe_position() for _ in range(NUM_GOALS)]
+
+# Pre-build a balanced colour pool so every colour appears roughly equally
+# e.g. 5 beacons → at least 1 of each + 2 random; 7 → at least 2 of each + 1
+_base   = COLOUR_NAMES * (NUM_GOALS // len(COLOUR_NAMES))
+_extra  = random.sample(COLOUR_NAMES, NUM_GOALS % len(COLOUR_NAMES))
+colours_pool = _base + _extra
+random.shuffle(colours_pool)
+
 print("[manager] %d distress positions:" % NUM_GOALS)
 for i, p in enumerate(positions):
-    print("   beacon %d: (%+.2f, %+.2f)" % (i, p[0], p[1]))
+    print("   beacon %d: (%+.2f, %+.2f) colour=%s" % (i, p[0], p[1], colours_pool[i]))
 
 spawned   = 0
 done_sent_until = None
@@ -117,13 +171,17 @@ while robot.step(TIME_STEP) != -1:
     # ── Activate the next beacon on schedule (they accumulate) ──────
     if spawned < NUM_GOALS and t >= 1.0 + spawned * BEACON_INTERVAL:
         bx, by = positions[spawned]
+        col_name = colours_pool[spawned]
+        cr, cg, cb = BEACON_COLOURS[col_name]
         root_children.importMFNodeFromString(
-            -1, BEACON_TEMPLATE % (spawned, bx, by, spawned))
+            -1, BEACON_TEMPLATE % (spawned, bx, by, spawned,
+                                   cr, cg, cb, cr, cg, cb))
         beacon_pos[spawned]     = (bx, by)
         beacon_node[spawned]    = robot.getFromDef("BEACON_%d" % spawned)
         beacon_spawn_t[spawned] = t
-        print("[manager] beacon %d ACTIVE at (%+.2f, %+.2f)  t=%.1f s"
-              % (spawned, bx, by, t))
+        beacon_colour[spawned]  = col_name
+        print("[manager] beacon %d ACTIVE at (%+.2f, %+.2f) colour=%s  t=%.1f s"
+              % (spawned, bx, by, col_name, t))
         spawned += 1
 
     # ── Collect bids ─────────────────────────────────────────────────
@@ -155,9 +213,10 @@ while robot.step(TIME_STEP) != -1:
         if best_r is not None:
             assigned[b] = best_r
             busy_robots.add(best_r)
-            auction_tx.send(("AWARD %d %d" % (b, best_r)).encode("utf-8"))
-            print("[manager] beacon %d AWARDED to scout %d (bid %.1f)"
-                  % (b, best_r, best_c))
+            col = beacon_colour.get(b, "red")
+            auction_tx.send(("AWARD %d %d %s" % (b, best_r, col)).encode("utf-8"))
+            print("[manager] beacon %d (%s) AWARDED to scout %d (bid %.1f)"
+                  % (b, col, best_r, best_c))
 
     # ── Rescue check: only the ASSIGNED robot can rescue its beacon ──
     for b, r in list(assigned.items()):

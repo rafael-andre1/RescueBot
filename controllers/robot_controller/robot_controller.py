@@ -115,6 +115,36 @@ LIDAR_FOV = lidar.getFov()   # Webots scanline: index 0 at +FOV/2, angle decreas
 
 camera   = robot.getDevice("camera")
 camera.enable(TIME_STEP)
+CAM_W = camera.getWidth()
+CAM_H = camera.getHeight()
+
+# Camera colour detection thresholds: (R_min, R_max, G_min, G_max, B_min, B_max)
+COLOUR_BANDS = {
+    "red":    (200, 255,   0,  60,   0,  60),
+    "yellow": (200, 255, 200, 255,   0,  80),
+    "green":  (  0,  80, 200, 255,   0,  80),
+}
+TARGET_PIXEL_MIN = 20         # qualifying pixels to confirm a beacon colour
+CAMERA_DIST      = 1.15       # activate camera scan within this est. range (m)
+
+
+def scan_for_colour(colour_name):
+    """Scan camera for the target colour. Returns (found, pixel_count)."""
+    band = COLOUR_BANDS.get(colour_name)
+    if band is None:
+        return False, 0
+    r_min, r_max, g_min, g_max, b_min, b_max = band
+    img = camera.getImage()
+    count = 0
+    for cy in range(CAM_H):
+        for cx in range(CAM_W):
+            r = camera.imageGetRed(img, CAM_W, cx, cy)
+            g = camera.imageGetGreen(img, CAM_W, cx, cy)
+            b = camera.imageGetBlue(img, CAM_W, cx, cy)
+            if (r_min <= r <= r_max and g_min <= g <= g_max
+                    and b_min <= b <= b_max):
+                count += 1
+    return count >= TARGET_PIXEL_MIN, count
 
 receiver = robot.getDevice("receiver")          # channel 1 — beacon SOS pings
 receiver.enable(TIME_STEP)
@@ -909,12 +939,18 @@ last_ping_time     = 0.0           # sim_time of the most recent SOS packet (any
 any_ping_ever      = False         # have we heard at least one SOS yet?
 
 # Auction state
-assigned_id   = None               # beacon id this scout is locked to (None = idle)
-have_goal     = False              # first estimate of my beacon received?
-taken         = set()              # beacon ids awarded to anyone (incl. me)
-last_rebid    = -1e9               # sim_time of last bid broadcast
-my_last_ping  = 0.0                # sim_time my assigned beacon was last heard
-done_received = False              # manager said the mission is over
+assigned_id    = None               # beacon id this scout is locked to (None = idle)
+assigned_colour = "red"             # colour of assigned beacon (from AWARD)
+have_goal      = False              # first estimate of my beacon received?
+taken          = set()              # beacon ids awarded to anyone (incl. me)
+last_rebid     = -1e9               # sim_time of last bid broadcast
+my_last_ping   = 0.0                # sim_time my assigned beacon was last heard
+my_beacon_range = float("inf")      # estimated range to assigned beacon (m)
+done_received  = False              # manager said the mission is over
+
+# Camera detection state
+camera_active  = False              # camera scanning enabled?
+person_found   = False              # target colour confirmed by camera?
 
 # Peer-avoidance state
 peers             = {}             # id → {pos, range, state, t}
@@ -977,15 +1013,19 @@ while robot.step(TIME_STEP) != -1:
     while auction_rx.getQueueLength() > 0:
         try:
             parts = auction_rx.getString().split()
-            if parts and parts[0] == "AWARD" and len(parts) == 3:
+            if parts and parts[0] == "AWARD" and len(parts) >= 3:
                 b, r = int(parts[1]), int(parts[2])
+                colour = parts[3] if len(parts) > 3 else "red"
                 taken.add(b)
                 if r == ROBOT_ID:
-                    assigned_id  = b
-                    have_goal    = False
-                    my_last_ping = sim_time
-                    print("[scout %d] WON beacon %d — locked until rescued"
-                          % (ROBOT_ID, b))
+                    assigned_id     = b
+                    assigned_colour = colour
+                    have_goal       = False
+                    my_last_ping    = sim_time
+                    camera_active   = False
+                    person_found    = False
+                    print("[scout %d] WON beacon %d (%s) — locked until rescued"
+                          % (ROBOT_ID, b, colour))
             elif parts and parts[0] == "POS" and len(parts) == 3:
                 pid, pstate = int(parts[1]), int(parts[2])
                 if pid != ROBOT_ID:
@@ -1069,6 +1109,7 @@ while robot.step(TIME_STEP) != -1:
         if assigned_id in packets:
             my_last_ping = sim_time
             s, b = packets[assigned_id]
+            my_beacon_range = 1.0 / math.sqrt(s)
             gx, gy = project_goal(robot_x, robot_y, heading, s, b)
             if (not have_goal
                     or math.hypot(gx - goal_x, gy - goal_y) > GOAL_MOVE_THRESH):
@@ -1078,14 +1119,31 @@ while robot.step(TIME_STEP) != -1:
                 map_changed = True
                 goal_px, goal_py = world_to_pix(goal_x, goal_y)
 
+            # Camera: activate when close enough, scan for assigned colour
+            if my_beacon_range < CAMERA_DIST:
+                if not camera_active:
+                    camera_active = True
+                    print("[camera %d] activated — est. %.2f m from beacon (looking for %s)"
+                          % (ROBOT_ID, my_beacon_range, assigned_colour))
+                if not person_found:
+                    found, count = scan_for_colour(assigned_colour)
+                    if found:
+                        person_found = True
+                        print("[scout %d] VISUAL CONFIRM — %s beacon spotted (%d pixels)"
+                              % (ROBOT_ID, assigned_colour.upper(), count))
+
         elif sim_time - my_last_ping > BEACON_SILENT_T:
             # My beacon went silent → the manager removed it → rescued.
             rescues_completed += 1
             rescued_positions.append((robot_x, robot_y))
-            print("[scout %d] beacon %d rescued (#%d for me, t=%.1f s) — back to idle"
-                  % (ROBOT_ID, assigned_id, rescues_completed, sim_time))
+            vis = " (colour confirmed)" if person_found else " (no visual)"
+            print("[scout %d] beacon %d rescued (#%d for me, t=%.1f s)%s — back to idle"
+                  % (ROBOT_ID, assigned_id, rescues_completed, sim_time, vis))
             assigned_id = None
             have_goal   = False
+            camera_active = False
+            person_found  = False
+            my_beacon_range = float("inf")
             goal_x, goal_y = 0.0, 0.0
             left_motor.setVelocity(0.0)
             right_motor.setVelocity(0.0)
