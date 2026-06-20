@@ -1091,9 +1091,12 @@ while robot.step(TIME_STEP) != -1:
             right_motor.setVelocity(0.0)
 
         if assigned_id is not None and have_goal and yielding_to is None:
-            # Drive: gradient descent with Line-of-Sight lookahead
-            # (walls AND stamped peers avoided by the planner itself)
-            lookahead_px, lookahead_py = get_lookahead_target(robot_px, robot_py, heading)
+            # Drive: if the goal is directly visible, go straight there;
+            # otherwise use gradient descent with Line-of-Sight lookahead.
+            if has_line_of_sight(robot_px, robot_py, goal_px, goal_py):
+                lookahead_px, lookahead_py = goal_px, goal_py
+            else:
+                lookahead_px, lookahead_py = get_lookahead_target(robot_px, robot_py, heading)
             lookahead_wx, lookahead_wy = pix_to_world(lookahead_px, lookahead_py)
             lv, rv = steer_to(robot_x, robot_y, heading, lookahead_wx, lookahead_wy)
             left_motor.setVelocity(lv)
