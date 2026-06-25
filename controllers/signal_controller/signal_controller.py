@@ -33,10 +33,18 @@ from controller import Supervisor
 NUM_ROBOTS      = 3          # scouts spawned at startup
 NUM_GOALS       = 5          # distress beacons over the whole mission
 BEACON_INTERVAL = 20.0       # seconds between beacon activations
-AUCTION_WINDOW  = 2.0        # bid-collection time before awarding (s)
+AUCTION_WINDOW  = 2.0        # bid-collection time before the FIRST assignment (s)
 RESCUE_RADIUS   = 0.40       # assigned robot within this → rescued (m)
 BID_FRESHNESS   = 3.0        # ignore bids older than this (s)
 CLUSTER_RADIUS  = 0.35       # scouts drop in a ring of this radius (m)
+
+# Dynamic reassignment (continuous market)
+MAX_CHANGES     = 2          # a goal may change hands at most this many times,
+                             # so a far goal eventually keeps a robot and is served
+COMMIT_COST     = 15.0       # an assignee whose bid (≈ remaining cost) is below this
+                             # is "committed" — never reassigned, so a robot is never
+                             # yanked off a goal it's about to reach
+INF = float("inf")
 
 TIME_STEP = 32
 
@@ -106,10 +114,21 @@ beacon_pos     = {}           # id → (x, y)
 beacon_node    = {}           # id → supervisor node ref
 beacon_spawn_t = {}           # id → sim time it appeared
 beacon_colour  = {}           # id → colour name ("red", "yellow", "green")
-assigned       = {}           # beacon id → robot id (locked, never changes)
 rescued        = set()        # beacon ids rescued
-busy_robots    = set()        # robot ids currently locked to a beacon
 bids           = {}           # (beacon, robot) → (cost, t_received)
+
+# Live assignment (can change — dynamic market)
+assignee       = {}           # beacon id → robot id (or absent = unassigned)
+task           = {r: None for r in range(NUM_ROBOTS)}   # robot → beacon (or None)
+reassign_count = {}           # beacon id → times reassigned (capped at MAX_CHANGES)
+
+
+def fresh_bid(b, r, t):
+    """Robot r's most recent bid on beacon b, if fresh; else None."""
+    e = bids.get((b, r))
+    if e is None or (t - e[1]) > BID_FRESHNESS:
+        return None
+    return e[0]
 # Wall rectangles from arena.wbt: (centre_x, centre_y, half_w, half_h)
 # with a safety margin so beacons don't spawn too close to walls.
 WALL_MARGIN = 0.30   # extra clearance around each wall (m)
@@ -176,10 +195,11 @@ while robot.step(TIME_STEP) != -1:
         root_children.importMFNodeFromString(
             -1, BEACON_TEMPLATE % (spawned, bx, by, spawned,
                                    cr, cg, cb, cr, cg, cb))
-        beacon_pos[spawned]     = (bx, by)
-        beacon_node[spawned]    = robot.getFromDef("BEACON_%d" % spawned)
-        beacon_spawn_t[spawned] = t
-        beacon_colour[spawned]  = col_name
+        beacon_pos[spawned]      = (bx, by)
+        beacon_node[spawned]     = robot.getFromDef("BEACON_%d" % spawned)
+        beacon_spawn_t[spawned]  = t
+        beacon_colour[spawned]   = col_name
+        reassign_count[spawned]  = 0
         print("[manager] beacon %d ACTIVE at (%+.2f, %+.2f) colour=%s  t=%.1f s"
               % (spawned, bx, by, col_name, t))
         spawned += 1
@@ -195,32 +215,91 @@ while robot.step(TIME_STEP) != -1:
             pass
         auction_rx.nextPacket()
 
-    # ── Award auctions (lowest fresh bid from a free robot wins) ────
-    for b in list(beacon_pos):
-        if b in assigned or b in rescued:
+    active = [b for b in beacon_pos if b not in rescued]
+
+    # ── (1) Initial assignment: give each unassigned beacon to the
+    #        lowest-bidding FREE robot (after a short bid-collection window) ──
+    for b in active:
+        if assignee.get(b) is not None:
             continue
         if t - beacon_spawn_t[b] < AUCTION_WINDOW:
-            continue                      # still collecting bids
-        best_r, best_c = None, float("inf")
+            continue
+        best_r, best_c = None, INF
         for r in range(NUM_ROBOTS):
-            if r in busy_robots:
+            if task[r] is not None:
                 continue
-            entry = bids.get((b, r))
-            if entry is None or (t - entry[1]) > BID_FRESHNESS:
-                continue
-            if entry[0] < best_c:
-                best_c, best_r = entry[0], r
+            c = fresh_bid(b, r, t)
+            if c is not None and c < best_c:
+                best_c, best_r = c, r
         if best_r is not None:
-            assigned[b] = best_r
-            busy_robots.add(best_r)
-            col = beacon_colour.get(b, "red")
-            auction_tx.send(("AWARD %d %d %s" % (b, best_r, col)).encode("utf-8"))
-            print("[manager] beacon %d (%s) AWARDED to scout %d (bid %.1f)"
-                  % (b, col, best_r, best_c))
+            assignee[b] = best_r
+            task[best_r] = b
+            print("[manager] beacon %d (%s) → scout %d (bid %.1f)"
+                  % (b, beacon_colour[b], best_r, best_c))
 
-    # ── Rescue check: only the ASSIGNED robot can rescue its beacon ──
-    for b, r in list(assigned.items()):
-        if b in rescued:
+    # ── (2) One reassignment / swap improvement per step ────────────
+    #   • Free closer robot B: switch b to B if B's bid < current assignee's.
+    #   • B busy on g2: swap only if the TOTAL cost drops.
+    #   Capped at MAX_CHANGES per goal; committed assignees are untouchable.
+    for b in active:
+        a = assignee.get(b)
+        if a is None or reassign_count[b] >= MAX_CHANGES:
+            continue
+        ca = fresh_bid(b, a, t)                 # current assignee's cost on b
+        if ca is None or ca < COMMIT_COST:
+            continue                            # a is committed / no fresh bid
+
+        cand, cand_c = None, INF                # best OTHER robot for b
+        for r in range(NUM_ROBOTS):
+            if r == a:
+                continue
+            c = fresh_bid(b, r, t)
+            if c is not None and c < cand_c:
+                cand_c, cand = c, r
+        if cand is None:
+            continue
+
+        g2 = task[cand]
+        if g2 is None:
+            # Candidate is free → switch if strictly closer
+            if cand_c < ca:
+                task[a] = None
+                assignee[b] = cand
+                task[cand] = b
+                reassign_count[b] += 1
+                print("[manager] beacon %d REASSIGNED scout %d → %d "
+                      "(%.1f < %.1f)  [change %d/%d]"
+                      % (b, a, cand, cand_c, ca, reassign_count[b], MAX_CHANGES))
+                break
+        elif g2 != b and reassign_count.get(g2, 0) < MAX_CHANGES:
+            # Candidate busy on g2 → swap only if total cost improves
+            cb_g2 = fresh_bid(g2, cand, t)      # candidate's cost on its goal
+            ca_g2 = fresh_bid(g2, a, t)         # assignee's cost on candidate's goal
+            if cb_g2 is None or ca_g2 is None or cb_g2 < COMMIT_COST:
+                continue
+            cur_sum = ca + cb_g2
+            new_sum = cand_c + ca_g2
+            if new_sum < cur_sum:
+                assignee[b]  = cand; task[cand] = b
+                assignee[g2] = a;    task[a]    = g2
+                reassign_count[b]  += 1
+                reassign_count[g2] += 1
+                print("[manager] SWAP beacons %d↔%d between scouts %d,%d "
+                      "(sum %.1f < %.1f)" % (b, g2, a, cand, new_sum, cur_sum))
+                break
+
+    # ── (3) Broadcast each robot's current task (authoritative) ─────
+    for r in range(NUM_ROBOTS):
+        b = task[r]
+        if b is None:
+            auction_tx.send(("TASK %d -1 none" % r).encode("utf-8"))
+        else:
+            auction_tx.send(("TASK %d %d %s" % (r, b, beacon_colour[b])).encode("utf-8"))
+
+    # ── (4) Rescue check: assigned robot within RESCUE_RADIUS ───────
+    for b in list(active):
+        r = assignee.get(b)
+        if r is None:
             continue
         node = scout_nodes[r]
         if node is None:
@@ -229,11 +308,12 @@ while robot.step(TIME_STEP) != -1:
         bx, by = beacon_pos[b]
         if (sx - bx) ** 2 + (sy - by) ** 2 < RESCUE_RADIUS ** 2:
             rescued.add(b)
-            busy_robots.discard(r)
+            assignee[b] = None
+            task[r] = None
             if beacon_node[b] is not None:
                 beacon_node[b].remove()
-            print("[manager] beacon %d RESCUED by scout %d  t=%.1f s"
-                  % (b, r, t))
+            auction_tx.send(("RESCUED %d %d" % (r, b)).encode("utf-8"))
+            print("[manager] beacon %d RESCUED by scout %d  t=%.1f s" % (b, r, t))
 
     # ── Mission end: everything spawned and rescued ─────────────────
     if spawned >= NUM_GOALS and len(rescued) >= NUM_GOALS:

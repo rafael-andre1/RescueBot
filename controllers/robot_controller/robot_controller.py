@@ -5,19 +5,22 @@ scout — distress-ping rescue robot (multi-robot auction variant).
   • Goals are unknown — each beacon pings "SOS <id>" with a robot-relative
     bearing + signal strength. Strength → estimated range (~1/sqrt(s));
     bearing + heading → world direction → projected goal estimate.
-  • AUCTION: while idle, the scout bids on every unawarded beacon it hears.
-    Bid = Dijkstra cost over the KNOWN map to the known cell closest to the
-    goal estimate, plus 1.5× straight-line for the unknown remainder.
-    Bids go to the signal manager on channel 2; the manager awards each
-    beacon to the lowest bidder. Awards are BLOCKING — once this scout wins
-    a beacon it is locked to it until physically rescued. No exchange.
+  • CONTINUOUS MARKET: the scout bids on EVERY beacon it hears (idle or
+    already assigned). Bid = Dijkstra cost over the KNOWN map to the known
+    cell closest to the goal estimate, plus 1.5× straight-line for the
+    unknown remainder. Bids go to the manager on channel 2; the manager
+    holds the authoritative assignment and may REASSIGN a beacon to a
+    cheaper robot — directly if the new robot is free, or via a swap if it
+    must improve the total cost. Each beacon changes hands at most twice.
+    The scout simply obeys the manager's "TASK <robot> <beacon>" messages.
   • Path-finding (Dijkstra over the live occupancy grid) routes around walls
     discovered en route. NO reactive obstacle avoidance, NO spiral search.
 
-Lifecycle: idle (sit, scan, bid) → win a beacon → home in on its pings via
-the cost gradient → beacon silenced by the manager when reached → back to
-idle. On "DONE" from the manager (or prolonged radio silence) the map is
-saved as slam_map_<id>.png and the controller exits.
+Lifecycle: bid every tick → manager assigns me a beacon (TASK) → home in on
+its pings via the cost gradient (straight line when visible) → manager says
+"RESCUED" when I reach it → back to idle. Assignment can change mid-run if
+the manager finds a better allocation. On "DONE" (or prolonged radio
+silence) the map is saved as slam_map_<id>.png and the controller exits.
 """
 from controller import Robot
 import math
@@ -55,11 +58,8 @@ IMPASSABLE_COST  = 1000
 GOAL_MOVE_THRESH = 0.20         # re-plan when bearing-derived goal moves > this (m)
 
 #  Auction (channel 2; the signal manager is the auctioneer)
-REBID_PERIOD       = 1.0      # while idle, refresh bids this often (s)
+REBID_PERIOD       = 1.0      # refresh bids this often, whether idle or assigned (s)
 BID_UNKNOWN_FACTOR = 1.5      # cost multiplier for the unknown remainder of a bid
-BEACON_SILENT_T    = 1.0      # my beacon silent this long → it was rescued (the
-                              # manager removes the beacon node at RESCUE_RADIUS,
-                              # so silence == arrival; no strength threshold needed)
 SILENCE_TIMEOUT    = 8.0      # idle + no SOS at all for this long after the first
                               # ping ever → assume mission over, save map and exit
 
@@ -941,13 +941,11 @@ rescued_positions  = []            # list of (wx, wy) — where each rescue happ
 last_ping_time     = 0.0           # sim_time of the most recent SOS packet (any beacon)
 any_ping_ever      = False         # have we heard at least one SOS yet?
 
-# Auction state
-assigned_id    = None               # beacon id this scout is locked to (None = idle)
-assigned_colour = "red"             # colour of assigned beacon (from AWARD)
+# Auction state (assignment is dynamic — the manager can reassign via TASK)
+assigned_id    = None               # beacon id currently assigned to me (None = idle)
+assigned_colour = "red"             # colour of assigned beacon (from TASK)
 have_goal      = False              # first estimate of my beacon received?
-taken          = set()              # beacon ids awarded to anyone (incl. me)
 last_rebid     = -1e9               # sim_time of last bid broadcast
-my_last_ping   = 0.0                # sim_time my assigned beacon was last heard
 my_beacon_range = float("inf")      # estimated range to assigned beacon (m)
 done_received  = False              # manager said the mission is over
 
@@ -1016,19 +1014,40 @@ while robot.step(TIME_STEP) != -1:
     while auction_rx.getQueueLength() > 0:
         try:
             parts = auction_rx.getString().split()
-            if parts and parts[0] == "AWARD" and len(parts) >= 3:
-                b, r = int(parts[1]), int(parts[2])
-                colour = parts[3] if len(parts) > 3 else "red"
-                taken.add(b)
+            if parts and parts[0] == "TASK" and len(parts) == 4:
+                # Authoritative assignment from the manager (may change anytime).
+                r, b = int(parts[1]), int(parts[2])
+                colour = parts[3]
                 if r == ROBOT_ID:
-                    assigned_id     = b
-                    assigned_colour = colour
-                    have_goal       = False
-                    my_last_ping    = sim_time
-                    camera_active   = False
-                    person_found    = False
-                    print("[scout %d] WON beacon %d (%s) — locked until rescued"
-                          % (ROBOT_ID, b, colour))
+                    new_id = None if b < 0 else b
+                    if new_id != assigned_id:
+                        assigned_id   = new_id
+                        have_goal     = False
+                        camera_active = False
+                        person_found  = False
+                        if new_id is None:
+                            goal_x, goal_y = 0.0, 0.0
+                            print("[scout %d] released — back to idle" % ROBOT_ID)
+                        else:
+                            assigned_colour = colour
+                            print("[scout %d] assigned beacon %d (%s)"
+                                  % (ROBOT_ID, new_id, colour))
+            elif parts and parts[0] == "RESCUED" and len(parts) == 3:
+                r, b = int(parts[1]), int(parts[2])
+                if r == ROBOT_ID:
+                    rescues_completed += 1
+                    rescued_positions.append((robot_x, robot_y))
+                    vis = " (colour confirmed)" if person_found else " (no visual)"
+                    print("[scout %d] beacon %d rescued (#%d for me, t=%.1f s)%s"
+                          % (ROBOT_ID, b, rescues_completed, sim_time, vis))
+                    assigned_id   = None
+                    have_goal     = False
+                    camera_active = False
+                    person_found  = False
+                    my_beacon_range = float("inf")
+                    goal_x, goal_y = 0.0, 0.0
+                    left_motor.setVelocity(0.0)
+                    right_motor.setVelocity(0.0)
             elif parts and parts[0] == "POS" and len(parts) == 3:
                 pid, pstate = int(parts[1]), int(parts[2])
                 if pid != ROBOT_ID:
@@ -1107,10 +1126,23 @@ while robot.step(TIME_STEP) != -1:
         }], filename="slam_map_%d.png" % ROBOT_ID)
         break
 
+    # ── Continuous market: bid on EVERY beacon I can hear (whether idle
+    #    or already assigned) so the manager can reassign goals to whoever
+    #    is closest. One Dijkstra flood over the known map serves all bids.
+    if packets and sim_time - last_rebid >= REBID_PERIOD:
+        last_rebid = sim_time
+        flood = known_flood(robot_px, robot_py)
+        for b in packets:
+            s, brg = packets[b]
+            gx, gy = project_goal(robot_x, robot_y, heading, s, brg)
+            cost_bid = bid_for_goal(flood, gx, gy)
+            if cost_bid < INF:
+                auction_tx.send(("BID %d %d %.3f"
+                                 % (b, ROBOT_ID, cost_bid)).encode("utf-8"))
+
     # ── ASSIGNED: home in on my beacon only ─────────────────────────
     if assigned_id is not None:
         if assigned_id in packets:
-            my_last_ping = sim_time
             s, b = packets[assigned_id]
             my_beacon_range = 1.0 / math.sqrt(s)
             gx, gy = project_goal(robot_x, robot_y, heading, s, b)
@@ -1142,22 +1174,9 @@ while robot.step(TIME_STEP) != -1:
                         person_found = True
                         print("[scout %d] VISUAL CONFIRM — %s beacon spotted (%d pixels)"
                               % (ROBOT_ID, assigned_colour.upper(), count))
-
-        elif sim_time - my_last_ping > BEACON_SILENT_T:
-            # My beacon went silent → the manager removed it → rescued.
-            rescues_completed += 1
-            rescued_positions.append((robot_x, robot_y))
-            vis = " (colour confirmed)" if person_found else " (no visual)"
-            print("[scout %d] beacon %d rescued (#%d for me, t=%.1f s)%s — back to idle"
-                  % (ROBOT_ID, assigned_id, rescues_completed, sim_time, vis))
-            assigned_id = None
-            have_goal   = False
-            camera_active = False
-            person_found  = False
-            my_beacon_range = float("inf")
-            goal_x, goal_y = 0.0, 0.0
-            left_motor.setVelocity(0.0)
-            right_motor.setVelocity(0.0)
+        # Rescue and reassignment are now driven by the manager (RESCUED / TASK
+        # on channel 2) — no beacon-silence guessing needed. If my beacon isn't
+        # heard this tick we just keep steering toward the last live goal.
 
         if assigned_id is not None and have_goal and yielding_to is None:
             # Drive: if the LIVE goal estimate is directly visible, steer
@@ -1183,21 +1202,9 @@ while robot.step(TIME_STEP) != -1:
             right_motor.setVelocity(0.0)
         continue
 
-    # ── IDLE: sit still, scan, and bid on unawarded beacons ─────────
+    # ── IDLE: sit still and scan (bidding already happened above) ───
     left_motor.setVelocity(0.0)
     right_motor.setVelocity(0.0)
-
-    candidates = [b for b in packets if b not in taken]
-    if candidates and sim_time - last_rebid >= REBID_PERIOD:
-        last_rebid = sim_time
-        flood = known_flood(robot_px, robot_py)   # one flood serves all bids
-        for b in candidates:
-            s, brg = packets[b]
-            gx, gy = project_goal(robot_x, robot_y, heading, s, brg)
-            cost_bid = bid_for_goal(flood, gx, gy)
-            if cost_bid < INF:
-                auction_tx.send(("BID %d %d %.3f"
-                                 % (b, ROBOT_ID, cost_bid)).encode("utf-8"))
 
     if map_changed or step_count % DRAW_INTERVAL == 0:
         draw_map(robot_px, robot_py, goal_px, goal_py)
