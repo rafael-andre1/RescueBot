@@ -927,7 +927,10 @@ one its close to the goal mesured from the signal strengh he arrived
 """
 prev_cell     = (-1, -1)
 step_count    = 0
-goal_x, goal_y = 0.0, 0.0          # placeholder; set when my beacon is heard
+goal_x, goal_y = 0.0, 0.0          # GATED goal — only moves > GOAL_MOVE_THRESH;
+                                   # drives the (expensive) cost-matrix replan
+live_goal_x, live_goal_y = 0.0, 0.0   # LIVE goal — refreshed every ping, used for
+live_goal_px, live_goal_py = 0, 0     # direct line-of-sight steering (no replan)
 robot_x, robot_y = 0.0, 0.0        # dead-reckoned pose, map origin = start
 prev_left_enc  = None              # initialised on first iteration
 prev_right_enc = None
@@ -1111,6 +1114,14 @@ while robot.step(TIME_STEP) != -1:
             s, b = packets[assigned_id]
             my_beacon_range = 1.0 / math.sqrt(s)
             gx, gy = project_goal(robot_x, robot_y, heading, s, b)
+
+            # LIVE goal: shift the target every single ping so the robot always
+            # aims at the freshest estimate (used for direct line-of-sight runs).
+            live_goal_x, live_goal_y   = gx, gy
+            live_goal_px, live_goal_py = world_to_pix(gx, gy)
+
+            # GATED goal: only nudge the planner's source (and pay for a replan)
+            # when the estimate has moved enough to matter.
             if (not have_goal
                     or math.hypot(gx - goal_x, gy - goal_y) > GOAL_MOVE_THRESH):
                 goal_x, goal_y = gx, gy
@@ -1149,13 +1160,16 @@ while robot.step(TIME_STEP) != -1:
             right_motor.setVelocity(0.0)
 
         if assigned_id is not None and have_goal and yielding_to is None:
-            # Drive: if the goal is directly visible, go straight there;
-            # otherwise use gradient descent with Line-of-Sight lookahead.
-            if has_line_of_sight(robot_px, robot_py, goal_px, goal_py):
-                lookahead_px, lookahead_py = goal_px, goal_py
+            # Drive: if the LIVE goal estimate is directly visible, steer
+            # straight at it — and it shifts every ping, so the robot keeps
+            # re-aiming at the freshest estimate. Otherwise fall back to the
+            # gradient path (which tracks the gated goal + cost matrix).
+            if has_line_of_sight(robot_px, robot_py, live_goal_px, live_goal_py):
+                lookahead_wx, lookahead_wy = live_goal_x, live_goal_y
+                lookahead_px, lookahead_py = live_goal_px, live_goal_py
             else:
                 lookahead_px, lookahead_py = get_lookahead_target(robot_px, robot_py, heading)
-            lookahead_wx, lookahead_wy = pix_to_world(lookahead_px, lookahead_py)
+                lookahead_wx, lookahead_wy = pix_to_world(lookahead_px, lookahead_py)
             lv, rv = steer_to(robot_x, robot_y, heading, lookahead_wx, lookahead_wy)
             left_motor.setVelocity(lv)
             right_motor.setVelocity(rv)
