@@ -53,6 +53,10 @@ ROBOT_FOOTPRINT_CELLS = 2    # half-width of robot's body footprint, in cells
 WALL_CERTAINTY   = 0.30
 IMPASSABLE       = 0.90
 IMPASSABLE_COST  = 1000
+MAX_COUNT        = 10     # hits/visits saturate here, so the grid stays adaptive:
+                          # a free pass decays a cell's wall evidence by 1, so a
+                          # removed obstacle (e.g. a rescued beacon) clears in a
+                          # few scans instead of being remembered forever
 
 #  Radio homing
 GOAL_MOVE_THRESH = 0.20         # re-plan when bearing-derived goal moves > this (m)
@@ -211,6 +215,29 @@ def get_cell_cost(x, y):
     return 1 + int(occ / IMPASSABLE * 8)
 
 
+def clear_occupancy_disc(wx, wy, radius_m):
+    """Mark a world-space disc as KNOWN-FREE (hits→0, visits→≥1).
+
+    A beacon is a physical box, so the LiDAR maps it as a wall while the
+    robot homes in. Once it's rescued the manager deletes that box, but the
+    wall marking would otherwise linger and keep blocking the planner there
+    forever. Clearing the disc removes that phantom wall. Any REAL wall we
+    over-clear self-heals on the very next scan (one hit → occupied again),
+    whereas the removed beacon stays cleared."""
+    cpx, cpy = world_to_pix(wx, wy)
+    rcx = int(radius_m / WORLD_X_MAX * MAP_CENTRE) + 1
+    rcy = int(radius_m / WORLD_Y_MAX * MAP_CENTRE) + 1
+    for dy in range(-rcy, rcy + 1):
+        for dx in range(-rcx, rcx + 1):
+            nx, ny = cpx + dx, cpy + dy
+            if 0 <= nx < MAP_SIZE and 0 <= ny < MAP_SIZE:
+                wpx, wpy = pix_to_world(nx, ny)
+                if (wpx - wx) ** 2 + (wpy - wy) ** 2 <= radius_m ** 2:
+                    hits[ny][nx] = 0
+                    if visits[ny][nx] == 0:
+                        visits[ny][nx] = 1     # now known, and free
+
+
 # ═══════════════════════════════════════════════════════════════════
 #  Bresenham line — trace a ray through the grid
 # ═══════════════════════════════════════════════════════════════════
@@ -252,10 +279,20 @@ def scan_lidar(robot_x, robot_y, heading, ranges):
             if not (0 <= cx < MAP_SIZE and 0 <= cy < MAP_SIZE):
                 continue
             if cx == epx and cy == epy and is_hit:
-                hits[cy][cx] += 1
-                visits[cy][cx] += 1
+                # Wall evidence: bump hits & visits, both capped at MAX_COUNT.
+                if hits[cy][cx]   < MAX_COUNT: hits[cy][cx]   += 1
+                if visits[cy][cx] < MAX_COUNT: visits[cy][cx] += 1
             else:
-                visits[cy][cx] += 1
+                # Free pass-through: constant decay of any wall evidence here,
+                # so a removed obstacle is forgotten after a few clear sweeps.
+                if hits[cy][cx] > 0:
+                    was_wall = is_wall(cx, cy)
+                    hits[cy][cx] -= 1
+                    if visits[cy][cx] < MAX_COUNT: visits[cy][cx] += 1
+                    if was_wall and not is_wall(cx, cy):
+                        state_changed = True   # cell just cleared → replan
+                elif visits[cy][cx] < MAX_COUNT:
+                    visits[cy][cx] += 1
 
         if is_hit and is_wall(epx, epy) != prev_wall:
             state_changed = True
