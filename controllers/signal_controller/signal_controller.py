@@ -30,7 +30,7 @@ import random
 from controller import Supervisor
 
 # ─── Mission parameters (the knobs you asked to be global) ──────────
-NUM_ROBOTS      = 10         # scouts spawned at startup
+NUM_ROBOTS      = 5        # scouts spawned at startup
 NUM_GOALS       = 0          # distress beacons over the mission (0 = spawn forever)
 BEACON_INTERVAL = 5.0        # seconds between beacon activations
 AUCTION_WINDOW  = 2.0        # bid-collection time before the FIRST assignment (s)
@@ -38,9 +38,7 @@ RESCUE_RADIUS   = 0.40       # assigned robot within this → rescued (m)
 BID_FRESHNESS   = 3.0        # ignore bids older than this (s)
 CLUSTER_RADIUS  = 0.35       # scouts drop in a ring of this radius (m)
 
-# Dynamic reassignment (continuous market)
-MAX_CHANGES     = 2          # a goal may change hands at most this many times,
-                             # so a far goal eventually keeps a robot and is served
+# Dynamic reassignment (continuous market) — no change cap
 COMMIT_COST     = 15.0       # an assignee whose bid (≈ remaining cost) is below this
                              # is "committed" — never reassigned, so a robot is never
                              # yanked off a goal it's about to reach
@@ -99,14 +97,20 @@ BEACON_COLOURS = {
 }
 COLOUR_NAMES = list(BEACON_COLOURS.keys())
 
+# Same little 0.15×0.15×0.1 box as the original beacon, but FLOATING at
+# MARKER_Z — above the LiDAR's single horizontal scan layer (~6 cm) — so
+# it looks the same yet is never detected as a wall. No phantom wall.
+MARKER_Z = 0.22                      # height above floor (LiDAR plane ≈ 0.06)
 BEACON_TEMPLATE = (
     'DEF BEACON_%d Robot { '
     'translation %.3f %.3f 0.05 '
     'name "beacon_%d" controller "beacon_controller" '
     'children [ '
-    'Shape { appearance PBRAppearance { baseColor %.1f %.1f %.1f emissiveColor %.1f %.1f %.1f '
-    'roughness 0.2 metalness 0 } geometry Box { size 0.15 0.15 0.1 } } '
     'Emitter { channel 1 } '
+    'Solid { translation 0 0 %.3f children [ '
+    'Shape { appearance PBRAppearance { baseColor %.1f %.1f %.1f '
+    'emissiveColor %.1f %.1f %.1f roughness 0.3 metalness 0 } '
+    'geometry Box { size 0.15 0.15 0.1 } } ] } '
     '] }'
 )
 
@@ -120,7 +124,6 @@ bids           = {}           # (beacon, robot) → (cost, t_received)
 # Live assignment (can change — dynamic market)
 assignee       = {}           # beacon id → robot id (or absent = unassigned)
 task           = {r: None for r in range(NUM_ROBOTS)}   # robot → beacon (or None)
-reassign_count = {}           # beacon id → times reassigned (capped at MAX_CHANGES)
 
 
 def fresh_bid(b, r, t):
@@ -186,13 +189,12 @@ while robot.step(TIME_STEP) != -1:
         col_name = random.choice(COLOUR_NAMES)
         cr, cg, cb = BEACON_COLOURS[col_name]
         root_children.importMFNodeFromString(
-            -1, BEACON_TEMPLATE % (spawned, bx, by, spawned,
+            -1, BEACON_TEMPLATE % (spawned, bx, by, spawned, MARKER_Z,
                                    cr, cg, cb, cr, cg, cb))
         beacon_pos[spawned]      = (bx, by)
         beacon_node[spawned]     = robot.getFromDef("BEACON_%d" % spawned)
         beacon_spawn_t[spawned]  = t
         beacon_colour[spawned]   = col_name
-        reassign_count[spawned]  = 0
         print("[manager] beacon %d ACTIVE at (%+.2f, %+.2f) colour=%s  t=%.1f s"
               % (spawned, bx, by, col_name, t))
         spawned += 1
@@ -233,10 +235,10 @@ while robot.step(TIME_STEP) != -1:
     # ── (2) One reassignment / swap improvement per step ────────────
     #   • Free closer robot B: switch b to B if B's bid < current assignee's.
     #   • B busy on g2: swap only if the TOTAL cost drops.
-    #   Capped at MAX_CHANGES per goal; committed assignees are untouchable.
+    #   No change cap; committed assignees (almost there) are untouchable.
     for b in active:
         a = assignee.get(b)
-        if a is None or reassign_count[b] >= MAX_CHANGES:
+        if a is None:
             continue
         ca = fresh_bid(b, a, t)                 # current assignee's cost on b
         if ca is None or ca < COMMIT_COST:
@@ -259,12 +261,10 @@ while robot.step(TIME_STEP) != -1:
                 task[a] = None
                 assignee[b] = cand
                 task[cand] = b
-                reassign_count[b] += 1
-                print("[manager] beacon %d REASSIGNED scout %d → %d "
-                      "(%.1f < %.1f)  [change %d/%d]"
-                      % (b, a, cand, cand_c, ca, reassign_count[b], MAX_CHANGES))
+                print("[manager] beacon %d REASSIGNED scout %d → %d (%.1f < %.1f)"
+                      % (b, a, cand, cand_c, ca))
                 break
-        elif g2 != b and reassign_count.get(g2, 0) < MAX_CHANGES:
+        elif g2 != b:
             # Candidate busy on g2 → swap only if total cost improves
             cb_g2 = fresh_bid(g2, cand, t)      # candidate's cost on its goal
             ca_g2 = fresh_bid(g2, a, t)         # assignee's cost on candidate's goal
@@ -275,8 +275,6 @@ while robot.step(TIME_STEP) != -1:
             if new_sum < cur_sum:
                 assignee[b]  = cand; task[cand] = b
                 assignee[g2] = a;    task[a]    = g2
-                reassign_count[b]  += 1
-                reassign_count[g2] += 1
                 print("[manager] SWAP beacons %d↔%d between scouts %d,%d "
                       "(sum %.1f < %.1f)" % (b, g2, a, cand, new_sum, cur_sum))
                 break
