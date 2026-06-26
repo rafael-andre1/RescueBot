@@ -30,9 +30,9 @@ import random
 from controller import Supervisor
 
 # ─── Mission parameters (the knobs you asked to be global) ──────────
-NUM_ROBOTS      = 3          # scouts spawned at startup
-NUM_GOALS       = 5          # distress beacons over the whole mission
-BEACON_INTERVAL = 20.0       # seconds between beacon activations
+NUM_ROBOTS      = 10         # scouts spawned at startup
+NUM_GOALS       = 0          # distress beacons over the mission (0 = spawn forever)
+BEACON_INTERVAL = 5.0        # seconds between beacon activations
 AUCTION_WINDOW  = 2.0        # bid-collection time before the FIRST assignment (s)
 RESCUE_RADIUS   = 0.40       # assigned robot within this → rescued (m)
 BID_FRESHNESS   = 3.0        # ignore bids older than this (s)
@@ -168,18 +168,9 @@ def _safe_position():
     return random.uniform(*X_RANGE), random.uniform(*Y_RANGE)  # fallback
 
 
-positions = [_safe_position() for _ in range(NUM_GOALS)]
-
-# Pre-build a balanced colour pool so every colour appears roughly equally
-# e.g. 5 beacons → at least 1 of each + 2 random; 7 → at least 2 of each + 1
-_base   = COLOUR_NAMES * (NUM_GOALS // len(COLOUR_NAMES))
-_extra  = random.sample(COLOUR_NAMES, NUM_GOALS % len(COLOUR_NAMES))
-colours_pool = _base + _extra
-random.shuffle(colours_pool)
-
-print("[manager] %d distress positions:" % NUM_GOALS)
-for i, p in enumerate(positions):
-    print("   beacon %d: (%+.2f, %+.2f) colour=%s" % (i, p[0], p[1], colours_pool[i]))
+print("[manager] spawning a beacon every %.0f s%s"
+      % (BEACON_INTERVAL,
+         " (forever)" if NUM_GOALS == 0 else " up to %d" % NUM_GOALS))
 
 spawned   = 0
 done_sent_until = None
@@ -188,9 +179,11 @@ while robot.step(TIME_STEP) != -1:
     t = robot.getTime()
 
     # ── Activate the next beacon on schedule (they accumulate) ──────
-    if spawned < NUM_GOALS and t >= 1.0 + spawned * BEACON_INTERVAL:
-        bx, by = positions[spawned]
-        col_name = colours_pool[spawned]
+    #    NUM_GOALS == 0 → spawn forever; position + colour chosen per spawn.
+    if ((NUM_GOALS == 0 or spawned < NUM_GOALS)
+            and t >= 1.0 + spawned * BEACON_INTERVAL):
+        bx, by = _safe_position()
+        col_name = random.choice(COLOUR_NAMES)
         cr, cg, cb = BEACON_COLOURS[col_name]
         root_children.importMFNodeFromString(
             -1, BEACON_TEMPLATE % (spawned, bx, by, spawned,
@@ -315,8 +308,9 @@ while robot.step(TIME_STEP) != -1:
             auction_tx.send(("RESCUED %d %d" % (r, b)).encode("utf-8"))
             print("[manager] beacon %d RESCUED by scout %d  t=%.1f s" % (b, r, t))
 
-    # ── Mission end: everything spawned and rescued ─────────────────
-    if spawned >= NUM_GOALS and len(rescued) >= NUM_GOALS:
+    # ── Mission end: only in finite mode (NUM_GOALS > 0). Infinite mode
+    #    runs until you stop the sim — scouts never receive DONE. ──────
+    if NUM_GOALS > 0 and spawned >= NUM_GOALS and len(rescued) >= NUM_GOALS:
         if done_sent_until is None:
             done_sent_until = t + 2.0
             print("[manager] all %d beacons rescued — broadcasting DONE" % NUM_GOALS)
