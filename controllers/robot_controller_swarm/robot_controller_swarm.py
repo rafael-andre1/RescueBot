@@ -42,6 +42,9 @@ R_MIN, R_MAX, G_MIN, G_MAX, B_MIN, B_MAX = COLOUR_BANDS.get(
     TARGET_COL, COLOUR_BANDS["red"])
 TARGET_PIXEL_MIN = 20
 
+# Hex colours for live display; fallback cyan used before detection
+COLOUR_HEX = {"red": 0xFF2222, "yellow": 0xFFFF00, "green": 0x00DD00}
+
 # ── Tuning ────────────────────────────────────────────────────────────────
 TIME_STEP        = 32
 CRUISE_SPEED     = 3.0
@@ -260,6 +263,27 @@ def scan_for_target():
     return count >= TARGET_PIXEL_MIN, count
 
 
+def detect_any_colour():
+    """Scan camera for ALL known colours autonomously (camera-based, not channel-based).
+    Returns (colour_name, pixel_count) for the dominant colour, or (None, 0)."""
+    img = camera.getImage()
+    counts = {name: 0 for name in COLOUR_BANDS}
+    for cy in range(CAM_H):
+        for cx in range(CAM_W):
+            r = camera.imageGetRed(img,   CAM_W, cx, cy)
+            g = camera.imageGetGreen(img, CAM_W, cx, cy)
+            b = camera.imageGetBlue(img,  CAM_W, cx, cy)
+            for name, (r_min, r_max, g_min, g_max, b_min, b_max) in COLOUR_BANDS.items():
+                if (r_min <= r <= r_max and g_min <= g <= g_max
+                        and b_min <= b <= b_max):
+                    counts[name] += 1
+    best_name = max(counts, key=counts.get)
+    best_count = counts[best_name]
+    if best_count >= TARGET_PIXEL_MIN:
+        return best_name, best_count
+    return None, 0
+
+
 def draw_camera_preview():
     img = camera.getImage()
     for cy in range(0, CAM_H, 2):
@@ -450,7 +474,7 @@ def navigate(ranges, ping_bearing):
 #  Display
 # ═══════════════════════════════════════════════════════════════════
 def draw_map(robot_px, robot_py, trajectory,
-             pinger_pix=None, show_camera=False, stop_pix=None):
+             pinger_pix=None, show_camera=False, stop_pix=None, detected_colour=None):
     display.setColor(0xDDDDDD)
     display.fillRectangle(0, 0, MAP_SIZE, MAP_SIZE)
 
@@ -471,7 +495,9 @@ def draw_map(robot_px, robot_py, trajectory,
                 continue
             display.drawPixel(x, y)
 
-    display.setColor(0x00CCCC)
+    # Trajectory drawn in camera-detected colour; cyan fallback before detection
+    traj_colour = COLOUR_HEX.get(detected_colour, 0x00CCCC) if detected_colour else 0x00CCCC
+    display.setColor(traj_colour)
     traj = trajectory[::4]
     for k in range(1, len(traj)):
         x0, y0 = world_to_pix(*traj[k - 1])
@@ -482,12 +508,13 @@ def draw_map(robot_px, robot_py, trajectory,
     display.drawLine(MAP_CENTRE - 5, MAP_CENTRE, MAP_CENTRE + 5, MAP_CENTRE)
     display.drawLine(MAP_CENTRE, MAP_CENTRE - 5, MAP_CENTRE, MAP_CENTRE + 5)
 
-    # Estimated beacon — red square + dashed link from the stop point.
+    # Estimated beacon — coloured square (matches camera detection) + dashed link.
     if pinger_pix is not None:
+        beacon_colour = COLOUR_HEX.get(detected_colour, 0xFF0000) if detected_colour else 0xFF0000
         if stop_pix is not None:
             display.setColor(0xFF8888)
             display.drawLine(stop_pix[0], stop_pix[1], pinger_pix[0], pinger_pix[1])
-        display.setColor(0xFF0000)
+        display.setColor(beacon_colour)
         display.fillRectangle(pinger_pix[0] - 4, pinger_pix[1] - 4, 8, 8)
 
     # Stop point (where the robot actually halted) — yellow ring.
@@ -646,11 +673,11 @@ def save_map_image(robot_maps, filename, ref_start):
 # ═══════════════════════════════════════════════════════════════════
 #  Shared-state I/O — pickle-based handoff between scouts
 # ═══════════════════════════════════════════════════════════════════
-def write_own_state(pinger_local, stop_local, trajectory, find_time):
+def write_own_state(pinger_local, stop_local, trajectory, find_time, cam_colour=None):
     state = {
         "id":         ROBOT_ID,
         "label":      LABEL,
-        "colour":     TARGET_COL,
+        "colour":     cam_colour if cam_colour else TARGET_COL,  # camera-detected wins
         "start_pos":  (START_X, START_Y),   # world translation from world file
         "hits":       hits,
         "visits":     visits,
@@ -681,11 +708,11 @@ def load_all_states():
     return out
 
 
-def emit_staged_map(pinger_local, stop_local, trajectory, find_time):
+def emit_staged_map(pinger_local, stop_local, trajectory, find_time, cam_colour=None):
     """Write our state, then load every state on disk and render the
     combined map for the current stage (= number of scouts arrived).
     The first finder's start translation defines the merged frame."""
-    write_own_state(pinger_local, stop_local, trajectory, find_time)
+    write_own_state(pinger_local, stop_local, trajectory, find_time, cam_colour)
     states = load_all_states()
     if not states:
         return
@@ -712,9 +739,10 @@ last_range    = INF
 last_bearing  = 0.0
 last_strength = 0.0
 prev_range    = INF
-person_found  = False
-camera_active = False
-reached       = False
+person_found     = False
+camera_active    = False
+reached          = False
+detected_colour  = None    # set by detect_any_colour() once camera confirms beacon
 trajectory    = []
 pinger_pix    = None
 pinger_local  = None
@@ -797,7 +825,8 @@ while robot.step(TIME_STEP) != -1:
         left_motor.setVelocity(0.0)
         right_motor.setVelocity(0.0)
         print("[scout %s] time limit (%.1f s) — gave up" % (ROBOT_ID, sim_time))
-        draw_map(robot_px, robot_py, trajectory, pinger_pix, camera_active)
+        draw_map(robot_px, robot_py, trajectory, pinger_pix, camera_active,
+                 detected_colour=detected_colour)
         break
 
     # ── Phase 1: spiral search ────────────────────────────────────
@@ -807,7 +836,8 @@ while robot.step(TIME_STEP) != -1:
         left_motor.setVelocity(lv)
         right_motor.setVelocity(rv)
         if step_count % DRAW_INTERVAL == 0:
-            draw_map(robot_px, robot_py, trajectory)
+            draw_map(robot_px, robot_py, trajectory,
+                     detected_colour=detected_colour)
         continue
 
     # ── Phase 2: potential-field homing; arrival = proximity + colour ──
@@ -821,14 +851,17 @@ while robot.step(TIME_STEP) != -1:
             print("[camera %s] activated — robot est. %.2f m from signal source"
                   % (ROBOT_ID, last_range))
         if not person_found:
-            found, count = scan_for_target()
+            col_name, count = detect_any_colour()
             if step_count % CAM_PRINT_STEPS == 0:
-                print("[camera %s] %d %s pixels detected (threshold: %d)"
-                      % (ROBOT_ID, count, TARGET_COL, TARGET_PIXEL_MIN))
-            if found:
+                best = col_name.upper() if col_name else "none"
+                print("[camera %s] %d pixels — best: %s (threshold: %d)"
+                      % (ROBOT_ID, count, best, TARGET_PIXEL_MIN))
+            if col_name is not None:
+                detected_colour = col_name
                 person_found = True
-                print("[scout %s] colour ID — %s confirmed at est. %.2f m, %.1f s"
-                      % (ROBOT_ID, TARGET_COL.upper(), last_range, sim_time))
+                print("[scout %s] CAMERA DETECT — %s beacon spotted (%d px) "
+                      "at est. %.2f m, %.1f s"
+                      % (ROBOT_ID, col_name.upper(), count, last_range, sim_time))
 
     # Arrival: BOTH proximity under RADIO_STOP_DIST AND colour confirmed.
     if person_found and last_range < RADIO_STOP_DIST:
@@ -847,9 +880,9 @@ while robot.step(TIME_STEP) != -1:
               % (ROBOT_ID, stop_local[0], stop_local[1],
                  pinger_local[0], pinger_local[1], last_range, sim_time))
         draw_map(robot_px, robot_py, trajectory, pinger_pix, camera_active,
-                 stop_pix=stop_pix)
+                 stop_pix=stop_pix, detected_colour=detected_colour)
         reached = True
-        emit_staged_map(pinger_local, stop_local, trajectory, sim_time)
+        emit_staged_map(pinger_local, stop_local, trajectory, sim_time, detected_colour)
         emit_staged_map._last_stage = len(load_all_states())
         continue
 
@@ -860,4 +893,5 @@ while robot.step(TIME_STEP) != -1:
     right_motor.setVelocity(rv)
 
     if step_count % DRAW_INTERVAL == 0:
-        draw_map(robot_px, robot_py, trajectory, pinger_pix, camera_active)
+        draw_map(robot_px, robot_py, trajectory, pinger_pix, camera_active,
+                 detected_colour=detected_colour)
