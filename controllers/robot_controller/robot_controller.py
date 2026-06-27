@@ -131,24 +131,31 @@ COLOUR_BANDS = {
 TARGET_PIXEL_MIN = 20         # qualifying pixels to confirm a beacon colour
 CAMERA_DIST      = 1.15       # activate camera scan within this est. range (m)
 
+# Hex colours for the live display (draw_map)
+COLOUR_HEX = {"red": 0xFF0000, "yellow": 0xFFFF00, "green": 0x00FF00}
+# Matplotlib colours for the saved PNG (save_map_image)
+COLOUR_MPL = {"red": "red", "yellow": "gold", "green": "limegreen"}
 
-def scan_for_colour(colour_name):
-    """Scan camera for the target colour. Returns (found, pixel_count)."""
-    band = COLOUR_BANDS.get(colour_name)
-    if band is None:
-        return False, 0
-    r_min, r_max, g_min, g_max, b_min, b_max = band
+
+def detect_any_colour():
+    """Scan camera for ALL known colours. Returns (colour_name, pixel_count)
+    of the colour with the most matching pixels, or (None, 0) if none found."""
     img = camera.getImage()
-    count = 0
+    counts = {name: 0 for name in COLOUR_BANDS}
     for cy in range(CAM_H):
         for cx in range(CAM_W):
             r = camera.imageGetRed(img, CAM_W, cx, cy)
             g = camera.imageGetGreen(img, CAM_W, cx, cy)
             b = camera.imageGetBlue(img, CAM_W, cx, cy)
-            if (r_min <= r <= r_max and g_min <= g <= g_max
-                    and b_min <= b <= b_max):
-                count += 1
-    return count >= TARGET_PIXEL_MIN, count
+            for name, (r_min, r_max, g_min, g_max, b_min, b_max) in COLOUR_BANDS.items():
+                if (r_min <= r <= r_max and g_min <= g <= g_max
+                        and b_min <= b <= b_max):
+                    counts[name] += 1
+    best_name = max(counts, key=counts.get)
+    best_count = counts[best_name]
+    if best_count >= TARGET_PIXEL_MIN:
+        return best_name, best_count
+    return None, 0
 
 receiver = robot.getDevice("receiver")          # channel 1 — beacon SOS pings
 receiver.enable(TIME_STEP)
@@ -902,11 +909,12 @@ def save_map_image(robot_maps, filename="slam_map.png"):
                    markersize=8, label="%s start" % lbl))
 
         if ppos:
-            px = [p[0] for p in ppos]
-            py = [p[1] for p in ppos]
-            ax.plot(px, py, linestyle="none", marker="*", color="crimson",
-                    markersize=14, zorder=6,
-                    markeredgecolor="darkred", markeredgewidth=0.5)
+            pcols = rm.get("pinger_colours", [])
+            for j, (ppx, ppy) in enumerate(ppos):
+                mc = COLOUR_MPL.get(pcols[j], "crimson") if j < len(pcols) else "crimson"
+                ax.plot(ppx, ppy, linestyle="none", marker="*", color=mc,
+                        markersize=14, zorder=6,
+                        markeredgecolor="darkred", markeredgewidth=0.5)
             legend_handles.append(
                 Line2D([0], [0], marker="*", color="w",
                        markerfacecolor="crimson", markersize=10,
@@ -951,6 +959,12 @@ def draw_map(robot_px, robot_py, goal_px, goal_py,
     display.fillOval(goal_px, goal_py, 3, 3)
     display.setColor(0x0000FF)
     display.fillOval(robot_px, robot_py, 3, 3)
+    # Draw rescued positions with their detected colours
+    for i, (rwx, rwy) in enumerate(rescued_positions):
+        rpx_d, rpy_d = world_to_pix(rwx, rwy)
+        col = COLOUR_HEX.get(rescued_colours[i], 0xFF00FF) if i < len(rescued_colours) else 0xFF00FF
+        display.setColor(col)
+        display.fillOval(rpx_d, rpy_d, 3, 3)
 
 
 # ═══════════════════════════════════════════════════════════════════
@@ -975,6 +989,7 @@ rescues_completed  = 0             # how many beacons this scout rescued
 origin_x, origin_y = 0.0, 0.0      # dead-reckoned frame origin (always 0,0 here)
 trajectory         = []            # list of (wx, wy) — robot path for the map
 rescued_positions  = []            # list of (wx, wy) — where each rescue happened
+rescued_colours    = []            # list of colour names — detected by camera per rescue
 last_ping_time     = 0.0           # sim_time of the most recent SOS packet (any beacon)
 any_ping_ever      = False         # have we heard at least one SOS yet?
 
@@ -987,8 +1002,9 @@ my_beacon_range = float("inf")      # estimated range to assigned beacon (m)
 done_received  = False              # manager said the mission is over
 
 # Camera detection state
-camera_active  = False              # camera scanning enabled?
-person_found   = False              # target colour confirmed by camera?
+camera_active   = False              # camera scanning enabled?
+person_found    = False              # target colour confirmed by camera?
+detected_colour = None               # colour detected by camera (autonomous)
 
 # Peer-avoidance state
 peers             = {}             # id → {pos, range, state, t}
@@ -1074,13 +1090,15 @@ while robot.step(TIME_STEP) != -1:
                 if r == ROBOT_ID:
                     rescues_completed += 1
                     rescued_positions.append((robot_x, robot_y))
-                    vis = " (colour confirmed)" if person_found else " (no visual)"
+                    rescued_colours.append(detected_colour or "unknown")
+                    vis = " (camera: %s)" % detected_colour if person_found else " (no visual)"
                     print("[scout %d] beacon %d rescued (#%d for me, t=%.1f s)%s"
                           % (ROBOT_ID, b, rescues_completed, sim_time, vis))
                     assigned_id   = None
                     have_goal     = False
-                    camera_active = False
-                    person_found  = False
+                    camera_active   = False
+                    person_found    = False
+                    detected_colour = None
                     my_beacon_range = float("inf")
                     goal_x, goal_y = 0.0, 0.0
                     left_motor.setVelocity(0.0)
@@ -1159,6 +1177,7 @@ while robot.step(TIME_STEP) != -1:
             "origin": (origin_x, origin_y),
             "trajectory": trajectory,
             "pinger_positions": rescued_positions,
+            "pinger_colours": rescued_colours,
             "label": "Scout %d" % ROBOT_ID,
         }], filename="slam_map_%d.png" % ROBOT_ID)
         break
@@ -1199,18 +1218,19 @@ while robot.step(TIME_STEP) != -1:
                 map_changed = True
                 goal_px, goal_py = world_to_pix(goal_x, goal_y)
 
-            # Camera: activate when close enough, scan for assigned colour
+            # Camera: activate when close enough, scan for ANY colour
             if my_beacon_range < CAMERA_DIST:
                 if not camera_active:
                     camera_active = True
-                    print("[camera %d] activated — est. %.2f m from beacon (looking for %s)"
-                          % (ROBOT_ID, my_beacon_range, assigned_colour))
+                    print("[camera %d] activated — est. %.2f m from beacon"
+                          % (ROBOT_ID, my_beacon_range))
                 if not person_found:
-                    found, count = scan_for_colour(assigned_colour)
-                    if found:
+                    col_name, count = detect_any_colour()
+                    if col_name is not None:
                         person_found = True
-                        print("[scout %d] VISUAL CONFIRM — %s beacon spotted (%d pixels)"
-                              % (ROBOT_ID, assigned_colour.upper(), count))
+                        detected_colour = col_name
+                        print("[scout %d] CAMERA DETECT — %s beacon spotted (%d pixels)"
+                              % (ROBOT_ID, col_name.upper(), count))
         # Rescue and reassignment are now driven by the manager (RESCUED / TASK
         # on channel 2) — no beacon-silence guessing needed. If my beacon isn't
         # heard this tick we just keep steering toward the last live goal.
