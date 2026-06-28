@@ -17,7 +17,7 @@ WALL_Z      = 0.15
 
 MAPS = {
     "easy": [
-        (0.0,  0.0,  0.05, 1.0),
+        (0.0,  1.2,  0.05, 1.0),   # vertical wall, kept off the central spawn ring
         (1.5, -1.0,  1.0,  0.05),
     ],
     "medium": [

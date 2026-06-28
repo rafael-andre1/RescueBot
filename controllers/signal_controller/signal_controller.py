@@ -411,11 +411,17 @@ while robot.step(TIME_STEP) != -1:
 
     # ── Benchmark: timed auto-exit → write CSV row, close Webots ────
     if RUN_SECONDS > 0 and t >= RUN_SECONDS:
-        auction_tx.send(b"DONE")                 # let scouts save their maps
         if RESULT_CSV:
             write_result_row()
         print("[manager] run complete at %.1f s — %d/%d rescued"
               % (t, len(rescued), spawned))
+        # Keep stepping for a short grace window, re-broadcasting DONE, so every
+        # scout actually RECEIVES it, saves its map, and exits its own process.
+        # Quitting in the same step would orphan the controller processes
+        # (Windows doesn't reliably reap them), which piles up across a sweep.
+        quit_deadline = t + 2.0
+        while robot.step(TIME_STEP) != -1 and robot.getTime() < quit_deadline:
+            auction_tx.send(b"DONE")
         robot.simulationQuit(0)
         break
 
