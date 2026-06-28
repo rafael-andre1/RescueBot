@@ -1,18 +1,18 @@
 """
-scout — distress-ping rescue robot (multi-robot auction variant).
+RescueBot — distress-ping rescue robot (multi-robot auction variant).
 
   • No GPS. Pose is dead-reckoned from wheel encoders, with compass for heading.
   • Goals are unknown — each beacon pings "SOS <id>" with a robot-relative
     bearing + signal strength. Strength → estimated range (~1/sqrt(s));
     bearing + heading → world direction → projected goal estimate.
-  • CONTINUOUS MARKET: the scout bids on EVERY beacon it hears (idle or
+  • CONTINUOUS MARKET: the RescueBot bids on EVERY beacon it hears (idle or
     already assigned). Bid = Dijkstra cost over the KNOWN map to the known
     cell closest to the goal estimate, plus 1.5× straight-line for the
     unknown remainder. Bids go to the manager on channel 2; the manager
     holds the authoritative assignment and may REASSIGN a beacon to a
     cheaper robot — directly if the new robot is free, or via a swap if it
     must improve the total cost. Each beacon changes hands at most twice.
-    The scout simply obeys the manager's "TASK <robot> <beacon>" messages.
+    The RescueBot simply obeys the manager's "TASK <robot> <beacon>" messages.
   • Path-finding (Dijkstra over the live occupancy grid) routes around walls
     discovered en route. NO reactive obstacle avoidance, NO spiral search.
 
@@ -97,7 +97,7 @@ NEIGHBOURS = [(-1, -1, DIAG), (-1, 0, STRAIGHT), (-1, 1, DIAG),
 # ═══════════════════════════════════════════════════════════════════
 robot = Robot()
 
-# Identity: spawned by the manager as "scout_<id>"
+# Identity: spawned by the manager as "RescueBot_<id>"
 ROBOT_NAME = robot.getName()
 try:
     ROBOT_ID = int(ROBOT_NAME.split("_")[-1])
@@ -105,16 +105,16 @@ except ValueError:
     ROBOT_ID = 0
 
 # World start position, passed by the supervisor via controllerArgs. This is
-# the ONLY cross-robot spatial datum we need: each scout maps in its own local
+# the ONLY cross-robot spatial datum we need: each RescueBot maps in its own local
 # (dead-reckoned) frame whose origin is its start, and the compass keeps every
-# frame axis-aligned with the world — so all per-scout grids merge into ONE
+# frame axis-aligned with the world — so all per-RescueBot grids merge into ONE
 # shared world map by pure translation (exactly as robot_controller_swarm does).
 START_X = float(sys.argv[1]) if len(sys.argv) > 1 else 0.0
 START_Y = float(sys.argv[2]) if len(sys.argv) > 2 else 0.0
 
-# Shared-state handoff: every scout runs THIS controller, so they share its
-# working directory. Each scout pickles its live SLAM state to slam_state_<id>.pkl;
-# any scout can then load them all and render the merged global map. Stamp the
+# Shared-state handoff: every RescueBot runs THIS controller, so they share its
+# working directory. Each RescueBot pickles its live SLAM state to slam_state_<id>.pkl;
+# any RescueBot can then load them all and render the merged global map. Stamp the
 # session start so a previous run's pickles are ignored.
 SESSION_START  = time.time()
 STATE_GLOB     = "slam_state_*.pkl"
@@ -156,11 +156,37 @@ COLOUR_BANDS = {
 }
 TARGET_PIXEL_MIN = 20         # qualifying pixels to confirm a beacon colour
 CAMERA_DIST      = 1.15       # activate camera scan within this est. range (m)
+RADIO_STOP_DIST  = 0.80       # ping is RESOLVED within this range AND once the
+                              # camera confirms its colour — same rule as
+                              # robot_controller_swarm.py (no need to touch it)
 
 # Hex colours for the live display (draw_map)
 COLOUR_HEX = {"red": 0xFF0000, "yellow": 0xFFFF00, "green": 0x00FF00}
-# Matplotlib colours for the saved PNG (save_map_image)
+# Matplotlib colours for the BEACON markers — these always match the colour the
+# CAMERA identified, so a beacon's colour on the map is its real colour.
 COLOUR_MPL = {"red": "red", "yellow": "gold", "green": "limegreen"}
+
+# Fixed per-robot colour for trajectory / start / stop / link — keyed by robot
+# id so a given RescueBot is ALWAYS the same colour, and deliberately NONE of the
+# beacon colours (red/yellow/green) so a trajectory is never confused with a goal.
+ROBOT_TRAJ_COLOURS = {
+    0: "tab:purple",
+    1: "tab:orange",
+    2: "tab:brown",
+    3: "tab:cyan",      # teal
+    4: "tab:pink",
+    5: "slategray",
+    6: "navy",
+    7: "darkviolet",
+}
+_ROBOT_TRAJ_PALETTE = list(ROBOT_TRAJ_COLOURS.values())
+
+
+def robot_colour(rid):
+    """Fixed trajectory colour for a RescueBot id (wraps the palette if needed)."""
+    if rid in ROBOT_TRAJ_COLOURS:
+        return ROBOT_TRAJ_COLOURS[rid]
+    return _ROBOT_TRAJ_PALETTE[rid % len(_ROBOT_TRAJ_PALETTE)]
 
 
 def detect_any_colour():
@@ -187,7 +213,7 @@ receiver = robot.getDevice("receiver")          # channel 1 — beacon SOS pings
 receiver.enable(TIME_STEP)
 
 # Auction bus (channel 2): built-in emitter sends bids, extra receiver
-# hears AWARD/DONE from the manager (and other scouts' bids, ignored).
+# hears AWARD/DONE from the manager (and other RescueBots' bids, ignored).
 auction_tx = robot.getDevice("emitter")
 auction_rx = robot.getDevice("auction_receiver")
 auction_rx.enable(TIME_STEP)
@@ -574,7 +600,7 @@ def read_sos_packets():
 
 
 def project_goal(robot_x, robot_y, heading, strength, bearing_rel):
-    """Strength + bearing → estimated goal position in this scout's frame."""
+    """Strength + bearing → estimated goal position in this RescueBot's frame."""
     rng = 1.0 / math.sqrt(strength)              # Webots default ~1/d² emission
     world_b = heading + bearing_rel
     return (robot_x + rng * math.cos(world_b),
@@ -812,7 +838,7 @@ def safe_target_override(rpx, rpy, robot_x, robot_y, heading, ranges, intended):
         if c < best_c:
             best_c, best = c, (nx, ny)
     if best is None:
-        return intended, False   # nothing safe — fall back to plan, scout will likely stop
+        return intended, False   # nothing safe — fall back to plan, RescueBot will likely stop
     return best, True
 
 
@@ -860,7 +886,7 @@ def save_map_image(robot_maps, filename="slam_map.png"):
         import matplotlib.patches as mpatches
         from matplotlib.lines import Line2D
     except ImportError:
-        print("[scout] install matplotlib + numpy:  pip install matplotlib numpy")
+        print("[RescueBot] install matplotlib + numpy:  pip install matplotlib numpy")
         return
 
     # ── Merge all robots into one global occupancy grid ──────────────
@@ -951,23 +977,23 @@ def save_map_image(robot_maps, filename="slam_map.png"):
     fig.tight_layout()
     fig.savefig(filename, dpi=150, bbox_inches="tight")
     plt.close(fig)
-    print("[scout] map saved → " + filename)
+    print("[RescueBot] map saved → " + filename)
 
 
 # ═══════════════════════════════════════════════════════════════════
 #  ONE shared global map (swarm rationale)
 #  ───────────────────────────────────────────────────────────────────
-#  Mirrors robot_controller_swarm.py: there is NOT a map per scout. Every
-#  scout pickles its live SLAM state (occupancy grid in its own local frame
-#  + its world start_pos + trajectory + camera-identified rescues). Any scout
-#  can load every state and merge them — translating each scout's grid by its
+#  Mirrors robot_controller_swarm.py: there is NOT a map per RescueBot. Every
+#  RescueBot pickles its live SLAM state (occupancy grid in its own local frame
+#  + its world start_pos + trajectory + camera-identified rescues). Any RescueBot
+#  can load every state and merge them — translating each RescueBot's grid by its
 #  start_pos — into ONE global occupancy grid in a single SHARED frame
 #  (centred on the world origin). The merged map is re-rendered continuously
-#  so it always reflects every scout's detections globally.
+#  so it always reflects every RescueBot's detections globally.
 #
 #  Two galleries are produced (each a single, continuously-updated global map,
 #  plus a per-rescue "stage" snapshot for the record):
-#    maps_traj/   — full global map: merged occupancy + every scout's
+#    maps_traj/   — full global map: merged occupancy + every RescueBot's
 #                   trajectory + start + each beacon in the colour its CAMERA
 #                   identified.
 #    clean_maps/  — merged occupancy + camera-coloured ping markers ONLY:
@@ -986,9 +1012,9 @@ STATE_WRITE_STEPS   = max(1, int(0.5 * 1000 / TIME_STEP))  # heartbeat state ~2 
 GLOBAL_RENDER_STEPS = max(1, int(3.0 * 1000 / TIME_STEP))  # refresh live global map ~3 s
 
 
-# ─── Shared-state I/O — pickle handoff so every scout sees every map ──
+# ─── Shared-state I/O — pickle handoff so every RescueBot sees every map ──
 def write_own_state():
-    """Pickle this scout's live SLAM state (atomic replace) so peers can
+    """Pickle this RescueBot's live SLAM state (atomic replace) so peers can
     merge it into the global map. Coords are LOCAL (origin = our start)."""
     state = {
         "id":                ROBOT_ID,
@@ -997,7 +1023,8 @@ def write_own_state():
         "hits":              hits,
         "visits":            visits,
         "trajectory":        list(trajectory),       # LOCAL coords
-        "rescued_positions": list(rescued_positions),# LOCAL coords
+        "rescued_positions": list(rescued_positions),# LOCAL coords — ping estimates
+        "rescued_stops":     list(rescued_stops),    # LOCAL coords — stop points
         "rescued_colours":   list(rescued_colours),  # camera-identified per rescue
         "wall_time":         time.time(),
     }
@@ -1011,7 +1038,7 @@ def write_own_state():
 
 
 def load_all_states():
-    """All session-valid scout states on disk, sorted by id (stable colours)."""
+    """All session-valid RescueBot states on disk, sorted by id (stable colours)."""
     out = []
     for path in glob.glob(STATE_GLOB):
         try:
@@ -1026,7 +1053,7 @@ def load_all_states():
 
 
 def save_global_map(robot_maps, filename, ref_start, clean=False):
-    """Merge every scout's occupancy grid into ONE global grid (each
+    """Merge every RescueBot's occupancy grid into ONE global grid (each
     translated by its start_pos so they share `ref_start` as the origin),
     then render it. clean=True drops robots/starts/trajectories, leaving
     just the merged obstacles and the camera-coloured ping markers."""
@@ -1038,13 +1065,13 @@ def save_global_map(robot_maps, filename, ref_start, clean=False):
         import matplotlib.patches as mpatches
         from matplotlib.lines import Line2D
     except ImportError:
-        print("[scout %d] install matplotlib + numpy:  pip install matplotlib numpy"
+        print("[RescueBot %d] install matplotlib + numpy:  pip install matplotlib numpy"
               % ROBOT_ID)
         return
 
     rsx, rsy = ref_start
 
-    # ── Merge all scouts into one global occupancy grid ──────────────
+    # ── Merge all RescueBots into one global occupancy grid ──────────────
     g_hits   = np.zeros((MAP_SIZE, MAP_SIZE), dtype=np.int32)
     g_visits = np.zeros((MAP_SIZE, MAP_SIZE), dtype=np.int32)
     for rm in robot_maps:
@@ -1093,11 +1120,11 @@ def save_global_map(robot_maps, filename, ref_start, clean=False):
                        edgecolor="gray", linewidth=0.5, label="Unexplored"),
     ]
 
-    tab10 = plt.cm.tab10.colors
     total_rescues = 0
+    seen_colours  = set()
 
-    # ── Ping markers (BOTH galleries) — each in its camera-identified colour,
-    #    placed in the shared frame via the owning scout's start offset. ──
+    # ── Beacon (ping) markers — BOTH galleries — ALWAYS in the colour the
+    #    camera identified, so a beacon's colour on the map is its real colour. ──
     for rm in robot_maps:
         sx, sy = rm["start_pos"]
         sxr, syr = sx - rsx, sy - rsy
@@ -1105,28 +1132,34 @@ def save_global_map(robot_maps, filename, ref_start, clean=False):
         rcs = rm.get("rescued_colours", [])
         total_rescues += len(rps)
         for j, (px, py) in enumerate(rps):
-            mc = COLOUR_MPL.get(rcs[j], "crimson") if j < len(rcs) else "crimson"
+            cname = rcs[j] if j < len(rcs) else None
+            mc = COLOUR_MPL.get(cname, "crimson")
+            if cname in COLOUR_MPL:
+                seen_colours.add(cname)
             ax.plot(px + sxr, py + syr, linestyle="none", marker="*", color=mc,
                     markersize=15, zorder=6,
                     markeredgecolor="black", markeredgewidth=0.6)
-    if total_rescues:
-        legend_handles.append(
-            Line2D([0], [0], marker="*", color="w", markerfacecolor="crimson",
-                   markeredgecolor="black", markersize=12,
-                   label="Beacon (camera id)"))
+    for cname in ("red", "yellow", "green"):
+        if cname in seen_colours:
+            legend_handles.append(
+                Line2D([0], [0], marker="*", color="w",
+                       markerfacecolor=COLOUR_MPL[cname], markeredgecolor="black",
+                       markersize=12, label="%s beacon (camera id)" % cname))
 
-    # ── Trajectories + starts (full gallery only) ────────────────────
+    # ── Trajectories + starts + stop points + dashed links to the ping
+    #    (full gallery only). Everything here is in the RescueBot's FIXED colour
+    #    (never a beacon colour) so each RescueBot is consistently identifiable
+    #    and a path is never confused with a goal. ──
     if not clean:
         for idx, rm in enumerate(robot_maps):
-            lbl = rm.get("label", "Scout %d" % rm.get("id", idx))
+            rid = rm.get("id", idx)
+            lbl = rm.get("label", "Scout %d" % rid)
             sx, sy = rm["start_pos"]
             sxr, syr = sx - rsx, sy - rsy
-            rcs = rm.get("rescued_colours", [])
-            # Trajectory colour: the most recent colour this scout's camera
-            # identified; a distinct per-scout colour before any detection.
-            tcol = COLOUR_MPL.get(rcs[-1], tab10[idx % len(tab10)]) if rcs \
-                else tab10[idx % len(tab10)]
+            tcol = robot_colour(rid)
             traj = rm.get("trajectory", [])
+            rps  = rm.get("rescued_positions", [])
+            rss  = rm.get("rescued_stops", [])
             if len(traj) > 1:
                 tx = [p[0] + sxr for p in traj]
                 ty = [p[1] + syr for p in traj]
@@ -1139,7 +1172,25 @@ def save_global_map(robot_maps, filename, ref_start, clean=False):
             legend_handles.append(
                 Line2D([0], [0], marker="P", color="w", markerfacecolor=tcol,
                        markersize=8, label="%s start" % lbl))
-        ax.set_title("Global SLAM map — %d scout%s · %d rescue%s"
+            # Stop point (open circle) + dashed link to the beacon estimate.
+            has_stop = False
+            for j, (stx, sty) in enumerate(rss):
+                sxp, syp = stx + sxr, sty + syr
+                ax.plot(sxp, syp, marker="o", markerfacecolor="none",
+                        markeredgecolor=tcol, markeredgewidth=1.8,
+                        markersize=11, zorder=5)
+                has_stop = True
+                if j < len(rps):
+                    ppx, ppy = rps[j][0] + sxr, rps[j][1] + syr
+                    ax.plot([sxp, ppx], [syp, ppy], color=tcol,
+                            linewidth=1.0, linestyle="--", alpha=0.7, zorder=4)
+            if has_stop:
+                legend_handles.append(
+                    Line2D([0], [0], marker="o", color="w",
+                           markerfacecolor="none", markeredgecolor=tcol,
+                           markeredgewidth=1.8, markersize=10,
+                           label="%s stop point" % lbl))
+        ax.set_title("Global SLAM map — %d RescueBot%s · %d rescue%s"
                      % (len(robot_maps), "s" if len(robot_maps) != 1 else "",
                         total_rescues, "s" if total_rescues != 1 else ""),
                      fontsize=11)
@@ -1159,14 +1210,14 @@ def save_global_map(robot_maps, filename, ref_start, clean=False):
     try:
         fig.savefig(tmp, dpi=150, bbox_inches="tight", format="png")
         plt.close(fig)
-        os.replace(tmp, filename)              # atomic: concurrent scouts can't corrupt it
+        os.replace(tmp, filename)              # atomic: concurrent RescueBots can't corrupt it
     except OSError:
         plt.close(fig)
         return
 
 
 def emit_global_maps(staged=False):
-    """Heartbeat our state, then merge ALL scouts into the one global map and
+    """Heartbeat our state, then merge ALL RescueBots into the one global map and
     refresh both galleries. staged=True also writes a per-rescue snapshot."""
     write_own_state()
     states = load_all_states()
@@ -1244,10 +1295,11 @@ live_goal_px, live_goal_py = 0, 0     # direct line-of-sight steering (no replan
 robot_x, robot_y = 0.0, 0.0        # dead-reckoned pose, map origin = start
 prev_left_enc  = None              # initialised on first iteration
 prev_right_enc = None
-rescues_completed  = 0             # how many beacons this scout rescued
+rescues_completed  = 0             # how many beacons this RescueBot rescued
 origin_x, origin_y = 0.0, 0.0      # dead-reckoned frame origin (always 0,0 here)
 trajectory         = []            # list of (wx, wy) — robot path for the map
-rescued_positions  = []            # list of (wx, wy) — where each rescue happened
+rescued_positions  = []            # list of (wx, wy) — ESTIMATED beacon (ping) positions
+rescued_stops      = []            # list of (wx, wy) — where the robot stopped per resolution
 rescued_colours    = []            # list of colour names — detected by camera per rescue
 last_ping_time     = 0.0           # sim_time of the most recent SOS packet (any beacon)
 any_ping_ever      = False         # have we heard at least one SOS yet?
@@ -1264,13 +1316,17 @@ done_received  = False              # manager said the mission is over
 camera_active   = False              # camera scanning enabled?
 person_found    = False              # target colour confirmed by camera?
 detected_colour = None               # colour detected by camera (autonomous)
+resolution_sent = False              # have I declared the current beacon RESOLVED
+                                     # (within RADIO_STOP_DIST + camera-confirmed)?
+recorded_beacons = set()             # beacon ids already drawn on the map (so a
+                                     # rescue is never recorded twice)
 
 # Peer-avoidance state
 peers             = {}             # id → {pos, range, state, t}
 yielding_to       = None           # peer id I'm stopped for (None = driving freely)
 last_marks_replan = -1e9           # throttle mark-triggered replans
 
-print("[scout %d] online — idle, listening for SOS to bid on" % ROBOT_ID)
+print("[RescueBot %d] online — idle, listening for SOS to bid on" % ROBOT_ID)
 
 while robot.step(TIME_STEP) != -1:
     step_count += 1
@@ -1311,9 +1367,9 @@ while robot.step(TIME_STEP) != -1:
             replan()
             map_changed = True
 
-    # ── Shared global map: heartbeat our SLAM state to disk so every scout
-    #    merges into ONE world map, and (scout 0) refresh the live global map
-    #    on a timer so it constantly reflects all scouts' detections. ──
+    # ── Shared global map: heartbeat our SLAM state to disk so every RescueBot
+    #    merges into ONE world map, and (RescueBot 0) refresh the live global map
+    #    on a timer so it constantly reflects all RescueBots' detections. ──
     if step_count % STATE_WRITE_STEPS == 0:
         write_own_state()
     if ROBOT_ID == 0 and step_count % GLOBAL_RENDER_STEPS == 0:
@@ -1325,7 +1381,7 @@ while robot.step(TIME_STEP) != -1:
         any_ping_ever  = True
         last_ping_time = sim_time
 
-    # ── Heartbeat: tell the other scouts where I am and if I'm moving ─
+    # ── Heartbeat: tell the other RescueBots where I am and if I'm moving ─
     my_state = 1 if (assigned_id is not None and have_goal
                      and yielding_to is None) else 0
     auction_tx.send(("POS %d %d" % (ROBOT_ID, my_state)).encode("utf-8"))
@@ -1341,38 +1397,46 @@ while robot.step(TIME_STEP) != -1:
                 if r == ROBOT_ID:
                     new_id = None if b < 0 else b
                     if new_id != assigned_id:
-                        assigned_id   = new_id
-                        have_goal     = False
-                        camera_active = False
-                        person_found  = False
+                        assigned_id     = new_id
+                        have_goal       = False
+                        camera_active   = False
+                        person_found    = False
+                        detected_colour = None
+                        resolution_sent = False
                         if new_id is None:
                             goal_x, goal_y = 0.0, 0.0
-                            print("[scout %d] released — back to idle" % ROBOT_ID)
+                            print("[RescueBot %d] released — back to idle" % ROBOT_ID)
                         else:
                             assigned_colour = colour
-                            print("[scout %d] assigned beacon %d (%s)"
+                            print("[RescueBot %d] assigned beacon %d (%s)"
                                   % (ROBOT_ID, new_id, colour))
             elif parts and parts[0] == "RESCUED" and len(parts) == 3:
                 r, b = int(parts[1]), int(parts[2])
                 if r == ROBOT_ID:
                     rescues_completed += 1
-                    rescued_positions.append((robot_x, robot_y))
-                    rescued_colours.append(detected_colour or "unknown")
+                    # Normally the ping was already recorded (ping estimate, stop
+                    # point, camera colour) the instant WE resolved it. Only if it
+                    # wasn't — e.g. the manager's ground-truth fallback fired
+                    # without a camera confirmation — do we log a bare fallback.
+                    if b not in recorded_beacons:
+                        rescued_positions.append((robot_x, robot_y))
+                        rescued_stops.append((robot_x, robot_y))
+                        rescued_colours.append(detected_colour or "unknown")
+                        recorded_beacons.add(b)
+                        emit_global_maps(staged=True)
                     vis = " (camera: %s)" % detected_colour if person_found else " (no visual)"
-                    print("[scout %d] beacon %d rescued (#%d for me, t=%.1f s)%s"
+                    print("[RescueBot %d] beacon %d rescued (#%d for me, t=%.1f s)%s"
                           % (ROBOT_ID, b, rescues_completed, sim_time, vis))
                     assigned_id   = None
                     have_goal     = False
                     camera_active   = False
                     person_found    = False
                     detected_colour = None
+                    resolution_sent = False
                     my_beacon_range = float("inf")
                     goal_x, goal_y = 0.0, 0.0
                     left_motor.setVelocity(0.0)
                     right_motor.setVelocity(0.0)
-                    # Refresh the ONE shared global map with this rescue (colour
-                    # from the camera id in rescued_colours) + a stage snapshot.
-                    emit_global_maps(staged=True)
             elif parts and parts[0] == "POS" and len(parts) == 3:
                 pid, pstate = int(parts[1]), int(parts[2])
                 if pid != ROBOT_ID:
@@ -1406,14 +1470,14 @@ while robot.step(TIME_STEP) != -1:
                 if (sim_time - p["t"] < PEER_FRESH and p["state"] == 1
                         and pid < ROBOT_ID and p["range"] < ROBOT_AVOID_DIST):
                     yielding_to = pid
-                    print("[scout %d] yielding to scout %d (%.2f m)"
+                    print("[RescueBot %d] yielding to RescueBot %d (%.2f m)"
                           % (ROBOT_ID, pid, p["range"]))
                     break
         else:
             p = peers.get(yielding_to)
             if (p is None or sim_time - p["t"] > 2.0 * PEER_FRESH
                     or p["state"] != 1 or p["range"] > ROBOT_RELEASE_DIST):
-                print("[scout %d] resuming (scout %s cleared)"
+                print("[RescueBot %d] resuming (RescueBot %s cleared)"
                       % (ROBOT_ID, yielding_to))
                 yielding_to = None
     else:
@@ -1436,7 +1500,7 @@ while robot.step(TIME_STEP) != -1:
     # ── End-of-mission: manager said DONE, or radio went dead ───────
     if done_received or (any_ping_ever and assigned_id is None
                          and (sim_time - last_ping_time) > SILENCE_TIMEOUT):
-        print("[scout %d] mission complete — %d rescue%s"
+        print("[RescueBot %d] mission complete — %d rescue%s"
               % (ROBOT_ID, rescues_completed,
                  "s" if rescues_completed != 1 else ""))
         left_motor.setVelocity(0.0)
@@ -1501,8 +1565,33 @@ while robot.step(TIME_STEP) != -1:
                     if col_name is not None:
                         person_found = True
                         detected_colour = col_name
-                        print("[scout %d] CAMERA DETECT — %s beacon spotted (%d pixels)"
+                        print("[RescueBot %d] CAMERA DETECT — %s beacon spotted (%d pixels)"
                               % (ROBOT_ID, col_name.upper(), count))
+
+            # Resolution — same rule as robot_controller_swarm.py: the ping is
+            # resolved within RADIO_STOP_DIST AND once the camera has confirmed
+            # its colour (NOT by physically touching it). We record the ping
+            # estimate + stop point in the camera colour, tell the manager so it
+            # frees the beacon, and refresh the global map.
+            if (person_found and my_beacon_range < RADIO_STOP_DIST
+                    and not resolution_sent):
+                stop_local = (robot_x, robot_y)
+                ping_world_angle = heading + b
+                pinger_local = (
+                    robot_x + my_beacon_range * math.cos(ping_world_angle),
+                    robot_y + my_beacon_range * math.sin(ping_world_angle),
+                )
+                rescued_positions.append(pinger_local)
+                rescued_stops.append(stop_local)
+                rescued_colours.append(detected_colour)
+                recorded_beacons.add(assigned_id)
+                resolution_sent = True
+                auction_tx.send(("RESOLVED %d %d"
+                                 % (ROBOT_ID, assigned_id)).encode("utf-8"))
+                print("[RescueBot %d] RESOLVED beacon %d (%s) at est. %.2f m, t=%.1f s"
+                      % (ROBOT_ID, assigned_id, detected_colour,
+                         my_beacon_range, sim_time))
+                emit_global_maps(staged=True)
         # Rescue and reassignment are now driven by the manager (RESCUED / TASK
         # on channel 2) — no beacon-silence guessing needed. If my beacon isn't
         # heard this tick we just keep steering toward the last live goal.
@@ -1525,7 +1614,7 @@ while robot.step(TIME_STEP) != -1:
                 draw_map(robot_px, robot_py, goal_px, goal_py,
                          lookahead_px, lookahead_py)
         else:
-            # Yielding to a higher-priority scout, or no packet from my
+            # Yielding to a higher-priority RescueBot, or no packet from my
             # beacon yet → hold position
             left_motor.setVelocity(0.0)
             right_motor.setVelocity(0.0)

@@ -200,13 +200,19 @@ while robot.step(TIME_STEP) != -1:
               % (spawned, bx, by, col_name, t))
         spawned += 1
 
-    # ── Collect bids ─────────────────────────────────────────────────
+    # ── Collect bids + rescue declarations ──────────────────────────
+    #   A robot declares "RESOLVED <robot> <beacon>" once it is within range
+    #   AND its camera has confirmed the beacon's colour (same rule as the
+    #   swarm) — we honour that rather than waiting for it to physically touch.
+    resolved_decls = set()
     while auction_rx.getQueueLength() > 0:
         try:
             parts = auction_rx.getString().split()
             if len(parts) == 4 and parts[0] == "BID":
                 b, r, c = int(parts[1]), int(parts[2]), float(parts[3])
                 bids[(b, r)] = (c, t)
+            elif len(parts) == 3 and parts[0] == "RESOLVED":
+                resolved_decls.add((int(parts[1]), int(parts[2])))
         except (ValueError, UnicodeDecodeError):
             pass
         auction_rx.nextPacket()
@@ -288,17 +294,23 @@ while robot.step(TIME_STEP) != -1:
         else:
             auction_tx.send(("TASK %d %d %s" % (r, b, beacon_colour[b])).encode("utf-8"))
 
-    # ── (4) Rescue check: assigned robot within RESCUE_RADIUS ───────
+    # ── (4) Rescue: primarily when the assigned robot DECLARES it resolved
+    #        (in range + camera-confirmed colour). A ground-truth proximity
+    #        check at RESCUE_RADIUS is kept only as a safety fallback so the
+    #        mission can never stall if a declaration is missed. ──────────
     for b in list(active):
         r = assignee.get(b)
         if r is None:
             continue
-        node = scout_nodes[r]
-        if node is None:
-            continue
-        sx, sy, _ = node.getPosition()
-        bx, by = beacon_pos[b]
-        if (sx - bx) ** 2 + (sy - by) ** 2 < RESCUE_RADIUS ** 2:
+        resolved = (r, b) in resolved_decls
+        if not resolved:
+            node = scout_nodes[r]
+            if node is None:
+                continue
+            sx, sy, _ = node.getPosition()
+            bx, by = beacon_pos[b]
+            resolved = (sx - bx) ** 2 + (sy - by) ** 2 < RESCUE_RADIUS ** 2
+        if resolved:
             rescued.add(b)
             assignee[b] = None
             task[r] = None
