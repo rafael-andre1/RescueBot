@@ -147,6 +147,8 @@ camera   = robot.getDevice("camera")
 camera.enable(TIME_STEP)
 CAM_W = camera.getWidth()
 CAM_H = camera.getHeight()
+CAM_FOV = camera.getFov()     # horizontal field of view (rad) — a beacon within
+                              # ±CAM_FOV/2 of our heading is actually in frame
 
 # Camera colour detection thresholds: (R_min, R_max, G_min, G_max, B_min, B_max)
 COLOUR_BANDS = {
@@ -1316,10 +1318,8 @@ done_received  = False              # manager said the mission is over
 camera_active   = False              # camera scanning enabled?
 person_found    = False              # target colour confirmed by camera?
 detected_colour = None               # colour detected by camera (autonomous)
-resolution_sent = False              # have I declared the current beacon RESOLVED
-                                     # (within RADIO_STOP_DIST + camera-confirmed)?
-recorded_beacons = set()             # beacon ids already drawn on the map (so a
-                                     # rescue is never recorded twice)
+recorded_beacons = set()             # beacon ids already resolved + drawn on the
+                                     # map (so a rescue is never recorded twice)
 
 # Peer-avoidance state
 peers             = {}             # id → {pos, range, state, t}
@@ -1402,7 +1402,6 @@ while robot.step(TIME_STEP) != -1:
                         camera_active   = False
                         person_found    = False
                         detected_colour = None
-                        resolution_sent = False
                         if new_id is None:
                             goal_x, goal_y = 0.0, 0.0
                             print("[RescueBot %d] released — back to idle" % ROBOT_ID)
@@ -1412,31 +1411,33 @@ while robot.step(TIME_STEP) != -1:
                                   % (ROBOT_ID, new_id, colour))
             elif parts and parts[0] == "RESCUED" and len(parts) == 3:
                 r, b = int(parts[1]), int(parts[2])
+                # RELEASE: if the completed beacon was MY assignment, drop it —
+                # whether I resolved it or a peer grabbed it opportunistically.
+                if b == assigned_id:
+                    assigned_id     = None
+                    have_goal       = False
+                    camera_active   = False
+                    person_found    = False
+                    detected_colour = None
+                    my_beacon_range = float("inf")
+                    goal_x, goal_y  = 0.0, 0.0
+                    left_motor.setVelocity(0.0)
+                    right_motor.setVelocity(0.0)
+                # CREDIT: if the manager credited ME as the resolver, count it.
                 if r == ROBOT_ID:
                     rescues_completed += 1
-                    # Normally the ping was already recorded (ping estimate, stop
-                    # point, camera colour) the instant WE resolved it. Only if it
-                    # wasn't — e.g. the manager's ground-truth fallback fired
-                    # without a camera confirmation — do we log a bare fallback.
+                    # Normally we already recorded this beacon (ping estimate,
+                    # stop point, camera colour) the instant we resolved it. Only
+                    # if we didn't — e.g. the manager's ground-truth fallback
+                    # fired without a camera confirmation — log a bare fallback.
                     if b not in recorded_beacons:
                         rescued_positions.append((robot_x, robot_y))
                         rescued_stops.append((robot_x, robot_y))
                         rescued_colours.append(detected_colour or "unknown")
                         recorded_beacons.add(b)
                         emit_global_maps(staged=True)
-                    vis = " (camera: %s)" % detected_colour if person_found else " (no visual)"
-                    print("[RescueBot %d] beacon %d rescued (#%d for me, t=%.1f s)%s"
-                          % (ROBOT_ID, b, rescues_completed, sim_time, vis))
-                    assigned_id   = None
-                    have_goal     = False
-                    camera_active   = False
-                    person_found    = False
-                    detected_colour = None
-                    resolution_sent = False
-                    my_beacon_range = float("inf")
-                    goal_x, goal_y = 0.0, 0.0
-                    left_motor.setVelocity(0.0)
-                    right_motor.setVelocity(0.0)
+                    print("[RescueBot %d] beacon %d rescued (#%d for me, t=%.1f s)"
+                          % (ROBOT_ID, b, rescues_completed, sim_time))
             elif parts and parts[0] == "POS" and len(parts) == 3:
                 pid, pstate = int(parts[1]), int(parts[2])
                 if pid != ROBOT_ID:
@@ -1496,6 +1497,41 @@ while robot.step(TIME_STEP) != -1:
             replan()
             map_changed = True
             last_marks_replan = sim_time
+
+    # ── Opportunistic resolution (same rule as robot_controller_swarm.py:
+    #    within RADIO_STOP_DIST AND camera-confirmed, NOT by touching). Resolve
+    #    ANY beacon I pass — mine or not — so a confirmed find is never wasted.
+    #    The id is the CLOSEST beacon I hear; spawn separation (>= 2x
+    #    RADIO_STOP_DIST) guarantees only one beacon can be within that radius,
+    #    so "closest" is unambiguous. The front gate (|bearing| <= CAM_FOV/2)
+    #    makes sure that beacon is actually in frame before trusting the colour. ──
+    if packets:
+        best_b, best_rng, best_brg = None, INF, 0.0
+        for bid, (s_b, brg_b) in packets.items():
+            rng_b = 1.0 / math.sqrt(s_b)
+            if rng_b < best_rng:
+                best_b, best_rng, best_brg = bid, rng_b, brg_b
+        if (best_b is not None and best_b not in recorded_beacons
+                and best_rng < RADIO_STOP_DIST
+                and abs(best_brg) <= CAM_FOV / 2.0):
+            col_name, count = detect_any_colour()
+            if col_name is not None:
+                ping_world_angle = heading + best_brg
+                pinger_local = (
+                    robot_x + best_rng * math.cos(ping_world_angle),
+                    robot_y + best_rng * math.sin(ping_world_angle),
+                )
+                rescued_positions.append(pinger_local)
+                rescued_stops.append((robot_x, robot_y))
+                rescued_colours.append(col_name)
+                recorded_beacons.add(best_b)
+                auction_tx.send(("RESOLVED %d %d"
+                                 % (ROBOT_ID, best_b)).encode("utf-8"))
+                tag = "" if best_b == assigned_id else " (opportunistic)"
+                print("[RescueBot %d] RESOLVED beacon %d (%s) at est. %.2f m, "
+                      "t=%.1f s%s"
+                      % (ROBOT_ID, best_b, col_name, best_rng, sim_time, tag))
+                emit_global_maps(staged=True)
 
     # ── End-of-mission: manager said DONE, or radio went dead ───────
     if done_received or (any_ping_ever and assigned_id is None
@@ -1567,31 +1603,6 @@ while robot.step(TIME_STEP) != -1:
                         detected_colour = col_name
                         print("[RescueBot %d] CAMERA DETECT — %s beacon spotted (%d pixels)"
                               % (ROBOT_ID, col_name.upper(), count))
-
-            # Resolution — same rule as robot_controller_swarm.py: the ping is
-            # resolved within RADIO_STOP_DIST AND once the camera has confirmed
-            # its colour (NOT by physically touching it). We record the ping
-            # estimate + stop point in the camera colour, tell the manager so it
-            # frees the beacon, and refresh the global map.
-            if (person_found and my_beacon_range < RADIO_STOP_DIST
-                    and not resolution_sent):
-                stop_local = (robot_x, robot_y)
-                ping_world_angle = heading + b
-                pinger_local = (
-                    robot_x + my_beacon_range * math.cos(ping_world_angle),
-                    robot_y + my_beacon_range * math.sin(ping_world_angle),
-                )
-                rescued_positions.append(pinger_local)
-                rescued_stops.append(stop_local)
-                rescued_colours.append(detected_colour)
-                recorded_beacons.add(assigned_id)
-                resolution_sent = True
-                auction_tx.send(("RESOLVED %d %d"
-                                 % (ROBOT_ID, assigned_id)).encode("utf-8"))
-                print("[RescueBot %d] RESOLVED beacon %d (%s) at est. %.2f m, t=%.1f s"
-                      % (ROBOT_ID, assigned_id, detected_colour,
-                         my_beacon_range, sim_time))
-                emit_global_maps(staged=True)
         # Rescue and reassignment are now driven by the manager (RESCUED / TASK
         # on channel 2) — no beacon-silence guessing needed. If my beacon isn't
         # heard this tick we just keep steering toward the last live goal.

@@ -35,6 +35,13 @@ NUM_GOALS       = 0          # distress beacons over the mission (0 = spawn fore
 BEACON_INTERVAL = 5.0        # seconds between beacon activations
 AUCTION_WINDOW  = 2.0        # bid-collection time before the FIRST assignment (s)
 RESCUE_RADIUS   = 0.40       # assigned robot within this → rescued (m)
+
+# Scouts resolve a ping within RADIO_STOP_DIST once their camera confirms its
+# colour. Beacons are spawned at least 2x that apart so a scout can never have
+# two pings inside its resolution radius at once — the beacon it sees is always
+# unambiguous, which is what makes opportunistic (resolve-on-sight) safe.
+RADIO_STOP_DIST = 0.80
+MIN_BEACON_SEP  = 2.0 * RADIO_STOP_DIST   # 1.6 m centre-to-centre
 BID_FRESHNESS   = 3.0        # ignore bids older than this (s)
 CLUSTER_RADIUS  = 0.35       # scouts drop in a ring of this radius (m)
 
@@ -162,14 +169,21 @@ def _position_clear(x, y):
     return True
 
 
-def _safe_position():
-    """Generate a random position that doesn't overlap with any wall."""
+def _safe_position(active_positions):
+    """Random position clear of walls AND at least MIN_BEACON_SEP from every
+    currently-active beacon. Returns None if no such spot is found (arena too
+    full right now) — the caller defers the spawn rather than placing one too
+    close, which would break the resolve-on-sight guarantee."""
+    sep2 = MIN_BEACON_SEP ** 2
     for _ in range(200):
         x = random.uniform(*X_RANGE)
         y = random.uniform(*Y_RANGE)
-        if _position_clear(x, y):
+        if not _position_clear(x, y):
+            continue
+        if all((x - ax) ** 2 + (y - ay) ** 2 >= sep2
+               for (ax, ay) in active_positions):
             return x, y
-    return random.uniform(*X_RANGE), random.uniform(*Y_RANGE)  # fallback
+    return None
 
 
 print("[manager] spawning a beacon every %.0f s%s"
@@ -186,19 +200,26 @@ while robot.step(TIME_STEP) != -1:
     #    NUM_GOALS == 0 → spawn forever; position + colour chosen per spawn.
     if ((NUM_GOALS == 0 or spawned < NUM_GOALS)
             and t >= 1.0 + spawned * BEACON_INTERVAL):
-        bx, by = _safe_position()
-        col_name = random.choice(COLOUR_NAMES)
-        cr, cg, cb = BEACON_COLOURS[col_name]
-        root_children.importMFNodeFromString(
-            -1, BEACON_TEMPLATE % (spawned, bx, by, spawned, MARKER_Z,
-                                   cr, cg, cb, cr, cg, cb))
-        beacon_pos[spawned]      = (bx, by)
-        beacon_node[spawned]     = robot.getFromDef("BEACON_%d" % spawned)
-        beacon_spawn_t[spawned]  = t
-        beacon_colour[spawned]   = col_name
-        print("[manager] beacon %d ACTIVE at (%+.2f, %+.2f) colour=%s  t=%.1f s"
-              % (spawned, bx, by, col_name, t))
-        spawned += 1
+        # Keep every new beacon >= MIN_BEACON_SEP from all CURRENTLY-active ones
+        # (rescued beacons are gone, so they free up space). If the arena is too
+        # crowded right now, defer: leave `spawned` unchanged so we retry next
+        # step and place it the moment a rescue opens room.
+        active_positions = [beacon_pos[bb] for bb in beacon_pos if bb not in rescued]
+        spot = _safe_position(active_positions)
+        if spot is not None:
+            bx, by = spot
+            col_name = random.choice(COLOUR_NAMES)
+            cr, cg, cb = BEACON_COLOURS[col_name]
+            root_children.importMFNodeFromString(
+                -1, BEACON_TEMPLATE % (spawned, bx, by, spawned, MARKER_Z,
+                                       cr, cg, cb, cr, cg, cb))
+            beacon_pos[spawned]      = (bx, by)
+            beacon_node[spawned]     = robot.getFromDef("BEACON_%d" % spawned)
+            beacon_spawn_t[spawned]  = t
+            beacon_colour[spawned]   = col_name
+            print("[manager] beacon %d ACTIVE at (%+.2f, %+.2f) colour=%s  t=%.1f s"
+                  % (spawned, bx, by, col_name, t))
+            spawned += 1
 
     # ── Collect bids + rescue declarations ──────────────────────────
     #   A robot declares "RESOLVED <robot> <beacon>" once it is within range
@@ -294,30 +315,35 @@ while robot.step(TIME_STEP) != -1:
         else:
             auction_tx.send(("TASK %d %d %s" % (r, b, beacon_colour[b])).encode("utf-8"))
 
-    # ── (4) Rescue: primarily when the assigned robot DECLARES it resolved
-    #        (in range + camera-confirmed colour). A ground-truth proximity
-    #        check at RESCUE_RADIUS is kept only as a safety fallback so the
-    #        mission can never stall if a declaration is missed. ──────────
+    # ── (4) Rescue: a beacon is resolved when ANY scout DECLARES it (in range
+    #        + camera-confirmed colour) — opportunistic, so a passing scout can
+    #        resolve a beacon that isn't its assignment, or one that's still
+    #        unassigned. A ground-truth proximity check on the assignee is kept
+    #        only as a safety fallback so the mission can never stall. ────────
     for b in list(active):
-        r = assignee.get(b)
-        if r is None:
-            continue
-        resolved = (r, b) in resolved_decls
-        if not resolved:
-            node = scout_nodes[r]
-            if node is None:
-                continue
-            sx, sy, _ = node.getPosition()
-            bx, by = beacon_pos[b]
-            resolved = (sx - bx) ** 2 + (sy - by) ** 2 < RESCUE_RADIUS ** 2
-        if resolved:
+        a = assignee.get(b)                       # current assignee (may be None)
+        # Resolver = the declaring scout if any, else the assignee (fallback).
+        resolver = next((rr for (rr, bb) in resolved_decls if bb == b), None)
+        if resolver is None and a is not None:
+            node = scout_nodes[a]
+            if node is not None:
+                sx, sy, _ = node.getPosition()
+                bx, by = beacon_pos[b]
+                if (sx - bx) ** 2 + (sy - by) ** 2 < RESCUE_RADIUS ** 2:
+                    resolver = a
+        if resolver is not None:
             rescued.add(b)
             assignee[b] = None
-            task[r] = None
+            if a is not None:
+                task[a] = None                    # free the assignee (if any)
             if beacon_node[b] is not None:
                 beacon_node[b].remove()
-            auction_tx.send(("RESCUED %d %d" % (r, b)).encode("utf-8"))
-            print("[manager] beacon %d RESCUED by scout %d  t=%.1f s" % (b, r, t))
+            # Credit the scout that actually resolved it.
+            auction_tx.send(("RESCUED %d %d" % (resolver, b)).encode("utf-8"))
+            extra = "" if resolver == a else " (opportunistic; was %s)" % (
+                "scout %d" % a if a is not None else "unassigned")
+            print("[manager] beacon %d RESCUED by scout %d  t=%.1f s%s"
+                  % (b, resolver, t, extra))
 
     # ── Mission end: only in finite mode (NUM_GOALS > 0). Infinite mode
     #    runs until you stop the sim — scouts never receive DONE. ──────
