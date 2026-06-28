@@ -1106,7 +1106,7 @@ def save_global_map(robot_maps, filename, ref_start, clean=False):
     img[wall_mask, 1] = shade
     img[wall_mask, 2] = shade
 
-    fig, ax = plt.subplots(figsize=(11, 7) if not clean else (8, 7), dpi=150)
+    fig, ax = plt.subplots(figsize=(11, 7) if not clean else (9, 7), dpi=150)
     ax.imshow(img, origin="upper",
               extent=[-WORLD_X_MAX, WORLD_X_MAX, -WORLD_Y_MAX, WORLD_Y_MAX],
               aspect="equal", interpolation="nearest")
@@ -1204,9 +1204,11 @@ def save_global_map(robot_maps, filename, ref_start, clean=False):
         ax.set_title("Global obstacle + ping map — %d rescue%s"
                      % (total_rescues, "s" if total_rescues != 1 else ""),
                      fontsize=11)
-        ax.legend(handles=legend_handles, loc="upper left",
-                  fontsize=7, framealpha=0.9, edgecolor="gray")
-        fig.tight_layout()
+        # Legend OUTSIDE the axes (right column) so it never covers a ping.
+        ax.legend(handles=legend_handles, bbox_to_anchor=(1.02, 1.0),
+                  loc="upper left", borderaxespad=0.0,
+                  fontsize=8, framealpha=0.95, edgecolor="gray")
+        fig.subplots_adjust(left=0.08, right=0.78, top=0.93, bottom=0.08)
 
     tmp = filename + ".tmp"
     try:
