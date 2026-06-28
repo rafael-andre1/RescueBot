@@ -25,14 +25,30 @@ When all NUM_GOALS beacons have been spawned and rescued, the manager
 broadcasts "DONE" for a couple of seconds (so every scout saves its map
 and exits) and stops.
 """
+import os
+import csv
 import math
 import random
+import statistics
 from controller import Supervisor
 
+import bench_maps
+
+# ─── Benchmark / reproducibility config (all overridable via env) ───
+# The benchmark harness sets these per run; defaults reproduce normal
+# interactive behaviour.
+SEED         = int(os.environ.get("RESCUE_SEED", "42"))
+random.seed(SEED)
+MAP_NAME     = os.environ.get("RESCUE_MAP", "medium")     # easy | medium | hard
+RUN_SECONDS  = float(os.environ.get("RESCUE_RUN_SECONDS", "0"))  # 0 = run forever
+RESULT_CSV   = os.environ.get("RESCUE_RESULT_CSV", "")    # "" = don't log a row
+
 # ─── Mission parameters (the knobs you asked to be global) ──────────
-NUM_ROBOTS      = 5        # scouts spawned at startup
+NUM_ROBOTS      = int(os.environ.get("RESCUE_ROBOTS", "5"))     # scouts at startup
 NUM_GOALS       = 0          # distress beacons over the mission (0 = spawn forever)
-BEACON_INTERVAL = 5.0        # seconds between beacon activations
+BEACON_INTERVAL = float(os.environ.get("RESCUE_INTERVAL", "5.0"))  # MEDIAN gap (s)
+BEACON_STD      = float(os.environ.get("RESCUE_STD", "1.5"))   # Gaussian gap std-dev
+BEACON_MIN_GAP  = 0.5        # clamp so a Gaussian draw never gives ≤0 s
 AUCTION_WINDOW  = 2.0        # bid-collection time before the FIRST assignment (s)
 RESCUE_RADIUS   = 0.40       # assigned robot within this → rescued (m)
 
@@ -140,25 +156,27 @@ def fresh_bid(b, r, t):
     if e is None or (t - e[1]) > BID_FRESHNESS:
         return None
     return e[0]
-# Wall rectangles from arena.wbt: (centre_x, centre_y, half_w, half_h)
-# with a safety margin so beacons don't spawn too close to walls.
+# Walls come from the chosen map (bench_maps). The supervisor SPAWNS them at
+# startup (so one world file serves easy/medium/hard) and also builds the
+# safe-placement rectangles (centre_x, centre_y, half_w+margin, half_h+margin)
+# so beacons never appear inside or hugging a wall.
 WALL_MARGIN = 0.30   # extra clearance around each wall (m)
-WALLS = [
-    # wall_1: vertical at (1.5, 0), Box 0.05×2
-    (1.5,   0.0,   0.05/2 + WALL_MARGIN, 2.0/2 + WALL_MARGIN),
-    # wall_2: horizontal at (-1.5, -1), Box 2×0.05
-    (-1.5, -1.0,   2.0/2 + WALL_MARGIN,  0.05/2 + WALL_MARGIN),
-    # wall_3: horizontal at (0, 2), Box 1.5×0.05
-    (0.0,   2.0,   1.5/2 + WALL_MARGIN,  0.05/2 + WALL_MARGIN),
-    # wall_4: vertical at (-2, 0.5), Box 0.05×2
-    (-2.0,  0.5,   0.05/2 + WALL_MARGIN, 2.0/2 + WALL_MARGIN),
-    # wall_5: horizontal at (2, -1.5), Box 2×0.05
-    (2.0,  -1.5,   2.0/2 + WALL_MARGIN,  0.05/2 + WALL_MARGIN),
-    # wall_6: vertical at (2.5, 1.25), Box 0.05×2
-    (2.5,   1.25,  0.05/2 + WALL_MARGIN, 2.0/2 + WALL_MARGIN),
-    # wall_7: horizontal at (-1, 1), Box 1×0.05
-    (-1.0,  1.0,   1.0/2 + WALL_MARGIN,  0.05/2 + WALL_MARGIN),
-]
+MAP_WALLS = bench_maps.get_map(MAP_NAME)   # list of (cx, cy, size_x, size_y)
+WALLS = [(cx, cy, sx / 2 + WALL_MARGIN, sy / 2 + WALL_MARGIN)
+         for (cx, cy, sx, sy) in MAP_WALLS]
+
+WALL_TEMPLATE = (
+    'Solid { translation %.3f %.3f %.3f '
+    'children [ Shape { appearance PBRAppearance { baseColor 0.7 0.4 0.2 '
+    'roughness 1 } geometry Box { size %.3f %.3f %.3f } } ] '
+    'name "wall_%d" boundingObject Box { size %.3f %.3f %.3f } }'
+)
+for _wi, (cx, cy, sx, sy) in enumerate(MAP_WALLS):
+    root_children.importMFNodeFromString(-1, WALL_TEMPLATE % (
+        cx, cy, bench_maps.WALL_Z,
+        sx, sy, bench_maps.WALL_HEIGHT, _wi,
+        sx, sy, bench_maps.WALL_HEIGHT))
+print("[manager] map=%s (%d walls)" % (MAP_NAME, len(MAP_WALLS)))
 
 
 def _position_clear(x, y):
@@ -186,20 +204,55 @@ def _safe_position(active_positions):
     return None
 
 
-print("[manager] spawning a beacon every %.0f s%s"
-      % (BEACON_INTERVAL,
+print("[manager] seed=%d | %d robots | beacon every ~%.0f±%.1f s (Gaussian)%s"
+      % (SEED, NUM_ROBOTS, BEACON_INTERVAL, BEACON_STD,
          " (forever)" if NUM_GOALS == 0 else " up to %d" % NUM_GOALS))
 
 spawned   = 0
 done_sent_until = None
+next_spawn_t = 1.0           # first beacon at t = 1 s; gaps are Gaussian after that
+
+# ─── Benchmark metrics ──────────────────────────────────────────────
+latencies        = []        # per beacon: rescue_time − spawn_time (s)
+backlog_samples  = []        # active-beacon count, sampled at 1 Hz
+last_backlog_t   = 0.0
+
+
+def write_result_row():
+    """Append one CSV row of aggregate metrics for this run."""
+    n  = len(rescued)
+    lat = latencies
+    row = {
+        "map":            MAP_NAME,
+        "robots":         NUM_ROBOTS,
+        "interval":       BEACON_INTERVAL,
+        "std":            BEACON_STD,
+        "seed":           SEED,
+        "run_seconds":    RUN_SECONDS,
+        "spawned":        spawned,
+        "rescued":        n,
+        "throughput_min": (n / RUN_SECONDS * 60.0) if RUN_SECONDS > 0 else 0.0,
+        "mean_latency":   (statistics.mean(lat)   if lat else ""),
+        "median_latency": (statistics.median(lat) if lat else ""),
+        "p95_latency":    (sorted(lat)[int(0.95 * (len(lat) - 1))] if lat else ""),
+        "mean_backlog":   (statistics.mean(backlog_samples) if backlog_samples else ""),
+        "final_backlog":  len([b for b in beacon_pos if b not in rescued]),
+    }
+    new_file = (not os.path.exists(RESULT_CSV)) or os.path.getsize(RESULT_CSV) == 0
+    with open(RESULT_CSV, "a", newline="") as f:
+        w = csv.DictWriter(f, fieldnames=list(row.keys()))
+        if new_file:
+            w.writeheader()
+        w.writerow(row)
+    print("[manager] result → %s : %s" % (RESULT_CSV, row))
+
 
 while robot.step(TIME_STEP) != -1:
     t = robot.getTime()
 
-    # ── Activate the next beacon on schedule (they accumulate) ──────
-    #    NUM_GOALS == 0 → spawn forever; position + colour chosen per spawn.
-    if ((NUM_GOALS == 0 or spawned < NUM_GOALS)
-            and t >= 1.0 + spawned * BEACON_INTERVAL):
+    # ── Activate the next beacon (they accumulate). Inter-spawn gap is
+    #    Gaussian: median = BEACON_INTERVAL, std = BEACON_STD. ─────────
+    if (NUM_GOALS == 0 or spawned < NUM_GOALS) and t >= next_spawn_t:
         # Keep every new beacon >= MIN_BEACON_SEP from all CURRENTLY-active ones
         # (rescued beacons are gone, so they free up space). If the arena is too
         # crowded right now, defer: leave `spawned` unchanged so we retry next
@@ -220,6 +273,11 @@ while robot.step(TIME_STEP) != -1:
             print("[manager] beacon %d ACTIVE at (%+.2f, %+.2f) colour=%s  t=%.1f s"
                   % (spawned, bx, by, col_name, t))
             spawned += 1
+            # Schedule the next spawn only on success — Gaussian gap compounds
+            # off the ACTUAL spawn time. (If a spawn was deferred for crowding,
+            # next_spawn_t is unchanged, so it keeps retrying every step.)
+            next_spawn_t = t + max(BEACON_MIN_GAP,
+                                   random.gauss(BEACON_INTERVAL, BEACON_STD))
 
     # ── Collect bids + rescue declarations ──────────────────────────
     #   A robot declares "RESOLVED <robot> <beacon>" once it is within range
@@ -333,6 +391,7 @@ while robot.step(TIME_STEP) != -1:
                     resolver = a
         if resolver is not None:
             rescued.add(b)
+            latencies.append(t - beacon_spawn_t[b])      # benchmark metric
             assignee[b] = None
             if a is not None:
                 task[a] = None                    # free the assignee (if any)
@@ -344,6 +403,21 @@ while robot.step(TIME_STEP) != -1:
                 "scout %d" % a if a is not None else "unassigned")
             print("[manager] beacon %d RESCUED by scout %d  t=%.1f s%s"
                   % (b, resolver, t, extra))
+
+    # ── Benchmark: sample backlog at 1 Hz ───────────────────────────
+    if t - last_backlog_t >= 1.0:
+        last_backlog_t = t
+        backlog_samples.append(len([b for b in beacon_pos if b not in rescued]))
+
+    # ── Benchmark: timed auto-exit → write CSV row, close Webots ────
+    if RUN_SECONDS > 0 and t >= RUN_SECONDS:
+        auction_tx.send(b"DONE")                 # let scouts save their maps
+        if RESULT_CSV:
+            write_result_row()
+        print("[manager] run complete at %.1f s — %d/%d rescued"
+              % (t, len(rescued), spawned))
+        robot.simulationQuit(0)
+        break
 
     # ── Mission end: only in finite mode (NUM_GOALS > 0). Infinite mode
     #    runs until you stop the sim — scouts never receive DONE. ──────
