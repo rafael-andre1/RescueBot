@@ -25,6 +25,11 @@ silence) the map is saved as slam_map_<id>.png and the controller exits.
 from controller import Robot
 import math
 import heapq
+import os
+import sys
+import glob
+import time
+import pickle
 
 #  Tuning knobs
 TIME_STEP        = 32
@@ -98,6 +103,27 @@ try:
     ROBOT_ID = int(ROBOT_NAME.split("_")[-1])
 except ValueError:
     ROBOT_ID = 0
+
+# World start position, passed by the supervisor via controllerArgs. This is
+# the ONLY cross-robot spatial datum we need: each scout maps in its own local
+# (dead-reckoned) frame whose origin is its start, and the compass keeps every
+# frame axis-aligned with the world — so all per-scout grids merge into ONE
+# shared world map by pure translation (exactly as robot_controller_swarm does).
+START_X = float(sys.argv[1]) if len(sys.argv) > 1 else 0.0
+START_Y = float(sys.argv[2]) if len(sys.argv) > 2 else 0.0
+
+# Shared-state handoff: every scout runs THIS controller, so they share its
+# working directory. Each scout pickles its live SLAM state to slam_state_<id>.pkl;
+# any scout can then load them all and render the merged global map. Stamp the
+# session start so a previous run's pickles are ignored.
+SESSION_START  = time.time()
+STATE_GLOB     = "slam_state_*.pkl"
+OWN_STATE_FILE = "slam_state_%d.pkl" % ROBOT_ID
+try:
+    if os.path.exists(OWN_STATE_FILE):
+        os.remove(OWN_STATE_FILE)          # drop our own stale file from a prior run
+except OSError:
+    pass
 
 left_motor  = robot.getDevice("left wheel motor")
 right_motor = robot.getDevice("right wheel motor")
@@ -928,6 +954,239 @@ def save_map_image(robot_maps, filename="slam_map.png"):
     print("[scout] map saved → " + filename)
 
 
+# ═══════════════════════════════════════════════════════════════════
+#  ONE shared global map (swarm rationale)
+#  ───────────────────────────────────────────────────────────────────
+#  Mirrors robot_controller_swarm.py: there is NOT a map per scout. Every
+#  scout pickles its live SLAM state (occupancy grid in its own local frame
+#  + its world start_pos + trajectory + camera-identified rescues). Any scout
+#  can load every state and merge them — translating each scout's grid by its
+#  start_pos — into ONE global occupancy grid in a single SHARED frame
+#  (centred on the world origin). The merged map is re-rendered continuously
+#  so it always reflects every scout's detections globally.
+#
+#  Two galleries are produced (each a single, continuously-updated global map,
+#  plus a per-rescue "stage" snapshot for the record):
+#    maps_traj/   — full global map: merged occupancy + every scout's
+#                   trajectory + start + each beacon in the colour its CAMERA
+#                   identified.
+#    clean_maps/  — merged occupancy + camera-coloured ping markers ONLY:
+#                   no robots, no starts, no trajectories — just walls + beacons.
+# ═══════════════════════════════════════════════════════════════════
+MAPS_TRAJ_DIR  = "maps_traj"
+CLEAN_MAPS_DIR = "clean_maps"
+for _d in (MAPS_TRAJ_DIR, CLEAN_MAPS_DIR):
+    try:
+        os.makedirs(_d, exist_ok=True)
+    except OSError:
+        pass
+
+GLOBAL_REF_START    = (0.0, 0.0)                          # shared centre = world origin
+STATE_WRITE_STEPS   = max(1, int(0.5 * 1000 / TIME_STEP))  # heartbeat state ~2 Hz
+GLOBAL_RENDER_STEPS = max(1, int(3.0 * 1000 / TIME_STEP))  # refresh live global map ~3 s
+
+
+# ─── Shared-state I/O — pickle handoff so every scout sees every map ──
+def write_own_state():
+    """Pickle this scout's live SLAM state (atomic replace) so peers can
+    merge it into the global map. Coords are LOCAL (origin = our start)."""
+    state = {
+        "id":                ROBOT_ID,
+        "label":             "Scout %d" % ROBOT_ID,
+        "start_pos":         (START_X, START_Y),     # world translation of our frame
+        "hits":              hits,
+        "visits":            visits,
+        "trajectory":        list(trajectory),       # LOCAL coords
+        "rescued_positions": list(rescued_positions),# LOCAL coords
+        "rescued_colours":   list(rescued_colours),  # camera-identified per rescue
+        "wall_time":         time.time(),
+    }
+    tmp = OWN_STATE_FILE + ".tmp"
+    try:
+        with open(tmp, "wb") as f:
+            pickle.dump(state, f, protocol=pickle.HIGHEST_PROTOCOL)
+        os.replace(tmp, OWN_STATE_FILE)
+    except OSError:
+        pass
+
+
+def load_all_states():
+    """All session-valid scout states on disk, sorted by id (stable colours)."""
+    out = []
+    for path in glob.glob(STATE_GLOB):
+        try:
+            if os.path.getmtime(path) < SESSION_START - 1.0:
+                continue                              # stale from a previous run
+            with open(path, "rb") as f:
+                out.append(pickle.load(f))
+        except (OSError, EOFError, pickle.UnpicklingError):
+            continue
+    out.sort(key=lambda s: s.get("id", 0))
+    return out
+
+
+def save_global_map(robot_maps, filename, ref_start, clean=False):
+    """Merge every scout's occupancy grid into ONE global grid (each
+    translated by its start_pos so they share `ref_start` as the origin),
+    then render it. clean=True drops robots/starts/trajectories, leaving
+    just the merged obstacles and the camera-coloured ping markers."""
+    try:
+        import numpy as np
+        import matplotlib
+        matplotlib.use("Agg")
+        import matplotlib.pyplot as plt
+        import matplotlib.patches as mpatches
+        from matplotlib.lines import Line2D
+    except ImportError:
+        print("[scout %d] install matplotlib + numpy:  pip install matplotlib numpy"
+              % ROBOT_ID)
+        return
+
+    rsx, rsy = ref_start
+
+    # ── Merge all scouts into one global occupancy grid ──────────────
+    g_hits   = np.zeros((MAP_SIZE, MAP_SIZE), dtype=np.int32)
+    g_visits = np.zeros((MAP_SIZE, MAP_SIZE), dtype=np.int32)
+    for rm in robot_maps:
+        sx, sy = rm["start_pos"]
+        dx, dy = sx - rsx, sy - rsy
+        off_px =  round(dx / WORLD_X_MAX * MAP_CENTRE)
+        off_py = -round(dy / WORLD_Y_MAX * MAP_CENTRE)
+        h = np.array(rm["hits"],   dtype=np.int32)
+        v = np.array(rm["visits"], dtype=np.int32)
+        sx0 = max(0, -off_px); sx1 = min(MAP_SIZE, MAP_SIZE - off_px)
+        dx0 = max(0,  off_px); dx1 = min(MAP_SIZE, MAP_SIZE + off_px)
+        sy0 = max(0, -off_py); sy1 = min(MAP_SIZE, MAP_SIZE - off_py)
+        dy0 = max(0,  off_py); dy1 = min(MAP_SIZE, MAP_SIZE + off_py)
+        if sx0 < sx1 and sy0 < sy1:
+            g_hits  [dy0:dy1, dx0:dx1] += h[sy0:sy1, sx0:sx1]
+            g_visits[dy0:dy1, dx0:dx1] += v[sy0:sy1, sx0:sx1]
+
+    with np.errstate(divide="ignore", invalid="ignore"):
+        occ = np.where(g_visits > 0, g_hits / g_visits, np.nan)
+
+    img = np.full((MAP_SIZE, MAP_SIZE, 4), [0.93, 0.93, 0.93, 1.0],
+                  dtype=np.float32)
+    free_mask = (~np.isnan(occ)) & (occ <= WALL_CERTAINTY)
+    img[free_mask] = [1.0, 1.0, 1.0, 1.0]
+    wall_mask = (~np.isnan(occ)) & (occ > WALL_CERTAINTY)
+    t_wall = np.clip(
+        (occ[wall_mask] - WALL_CERTAINTY) / (IMPASSABLE - WALL_CERTAINTY), 0, 1)
+    shade = 0.35 * (1.0 - t_wall)
+    img[wall_mask, 0] = shade
+    img[wall_mask, 1] = shade
+    img[wall_mask, 2] = shade
+
+    fig, ax = plt.subplots(figsize=(11, 7) if not clean else (8, 7), dpi=150)
+    ax.imshow(img, origin="upper",
+              extent=[-WORLD_X_MAX, WORLD_X_MAX, -WORLD_Y_MAX, WORLD_Y_MAX],
+              aspect="equal", interpolation="nearest")
+    ax.set_xlabel("X (m)  — shared world frame", fontsize=9)
+    ax.set_ylabel("Y (m)  — shared world frame", fontsize=9)
+    ax.grid(True, linestyle="--", linewidth=0.4, alpha=0.4, color="#888888")
+
+    legend_handles = [
+        mpatches.Patch(facecolor=(0.20, 0.20, 0.20), label="Wall"),
+        mpatches.Patch(facecolor=(1.00, 1.00, 1.00),
+                       edgecolor="gray", linewidth=0.5, label="Free (explored)"),
+        mpatches.Patch(facecolor=(0.93, 0.93, 0.93),
+                       edgecolor="gray", linewidth=0.5, label="Unexplored"),
+    ]
+
+    tab10 = plt.cm.tab10.colors
+    total_rescues = 0
+
+    # ── Ping markers (BOTH galleries) — each in its camera-identified colour,
+    #    placed in the shared frame via the owning scout's start offset. ──
+    for rm in robot_maps:
+        sx, sy = rm["start_pos"]
+        sxr, syr = sx - rsx, sy - rsy
+        rps = rm.get("rescued_positions", [])
+        rcs = rm.get("rescued_colours", [])
+        total_rescues += len(rps)
+        for j, (px, py) in enumerate(rps):
+            mc = COLOUR_MPL.get(rcs[j], "crimson") if j < len(rcs) else "crimson"
+            ax.plot(px + sxr, py + syr, linestyle="none", marker="*", color=mc,
+                    markersize=15, zorder=6,
+                    markeredgecolor="black", markeredgewidth=0.6)
+    if total_rescues:
+        legend_handles.append(
+            Line2D([0], [0], marker="*", color="w", markerfacecolor="crimson",
+                   markeredgecolor="black", markersize=12,
+                   label="Beacon (camera id)"))
+
+    # ── Trajectories + starts (full gallery only) ────────────────────
+    if not clean:
+        for idx, rm in enumerate(robot_maps):
+            lbl = rm.get("label", "Scout %d" % rm.get("id", idx))
+            sx, sy = rm["start_pos"]
+            sxr, syr = sx - rsx, sy - rsy
+            rcs = rm.get("rescued_colours", [])
+            # Trajectory colour: the most recent colour this scout's camera
+            # identified; a distinct per-scout colour before any detection.
+            tcol = COLOUR_MPL.get(rcs[-1], tab10[idx % len(tab10)]) if rcs \
+                else tab10[idx % len(tab10)]
+            traj = rm.get("trajectory", [])
+            if len(traj) > 1:
+                tx = [p[0] + sxr for p in traj]
+                ty = [p[1] + syr for p in traj]
+                ax.plot(tx, ty, color=tcol, linewidth=1.1, alpha=0.85, zorder=3)
+                legend_handles.append(
+                    Line2D([0], [0], color=tcol, linewidth=1.5,
+                           label="%s trajectory" % lbl))
+            ax.plot(sxr, syr, marker="P", color=tcol, markersize=9,
+                    markeredgecolor="white", markeredgewidth=0.7, zorder=5)
+            legend_handles.append(
+                Line2D([0], [0], marker="P", color="w", markerfacecolor=tcol,
+                       markersize=8, label="%s start" % lbl))
+        ax.set_title("Global SLAM map — %d scout%s · %d rescue%s"
+                     % (len(robot_maps), "s" if len(robot_maps) != 1 else "",
+                        total_rescues, "s" if total_rescues != 1 else ""),
+                     fontsize=11)
+        ax.legend(handles=legend_handles, bbox_to_anchor=(1.02, 1.0),
+                  loc="upper left", borderaxespad=0.0,
+                  fontsize=8, framealpha=0.95, edgecolor="gray")
+        fig.subplots_adjust(left=0.07, right=0.72, top=0.93, bottom=0.08)
+    else:
+        ax.set_title("Global obstacle + ping map — %d rescue%s"
+                     % (total_rescues, "s" if total_rescues != 1 else ""),
+                     fontsize=11)
+        ax.legend(handles=legend_handles, loc="upper left",
+                  fontsize=7, framealpha=0.9, edgecolor="gray")
+        fig.tight_layout()
+
+    tmp = filename + ".tmp"
+    try:
+        fig.savefig(tmp, dpi=150, bbox_inches="tight", format="png")
+        plt.close(fig)
+        os.replace(tmp, filename)              # atomic: concurrent scouts can't corrupt it
+    except OSError:
+        plt.close(fig)
+        return
+
+
+def emit_global_maps(staged=False):
+    """Heartbeat our state, then merge ALL scouts into the one global map and
+    refresh both galleries. staged=True also writes a per-rescue snapshot."""
+    write_own_state()
+    states = load_all_states()
+    if not states:
+        return
+    save_global_map(states, os.path.join(MAPS_TRAJ_DIR, "global_map.png"),
+                    GLOBAL_REF_START, clean=False)
+    save_global_map(states, os.path.join(CLEAN_MAPS_DIR, "global_clean_map.png"),
+                    GLOBAL_REF_START, clean=True)
+    if staged:
+        n = sum(len(s.get("rescued_positions", [])) for s in states)
+        save_global_map(states,
+                        os.path.join(MAPS_TRAJ_DIR, "global_map_stage%d.png" % n),
+                        GLOBAL_REF_START, clean=False)
+        save_global_map(states,
+                        os.path.join(CLEAN_MAPS_DIR,
+                                     "global_clean_map_stage%d.png" % n),
+                        GLOBAL_REF_START, clean=True)
+
+
 def draw_map(robot_px, robot_py, goal_px, goal_py,
              target_px=None, target_py=None):
     display.setColor(0xDDDDDD)
@@ -1052,6 +1311,14 @@ while robot.step(TIME_STEP) != -1:
             replan()
             map_changed = True
 
+    # ── Shared global map: heartbeat our SLAM state to disk so every scout
+    #    merges into ONE world map, and (scout 0) refresh the live global map
+    #    on a timer so it constantly reflects all scouts' detections. ──
+    if step_count % STATE_WRITE_STEPS == 0:
+        write_own_state()
+    if ROBOT_ID == 0 and step_count % GLOBAL_RENDER_STEPS == 0:
+        emit_global_maps(staged=False)
+
     # ── Radio: per-beacon SOS packets (channel 1) ────────────────────
     packets = read_sos_packets()
     if packets:
@@ -1103,6 +1370,9 @@ while robot.step(TIME_STEP) != -1:
                     goal_x, goal_y = 0.0, 0.0
                     left_motor.setVelocity(0.0)
                     right_motor.setVelocity(0.0)
+                    # Refresh the ONE shared global map with this rescue (colour
+                    # from the camera id in rescued_colours) + a stage snapshot.
+                    emit_global_maps(staged=True)
             elif parts and parts[0] == "POS" and len(parts) == 3:
                 pid, pstate = int(parts[1]), int(parts[2])
                 if pid != ROBOT_ID:
@@ -1180,6 +1450,8 @@ while robot.step(TIME_STEP) != -1:
             "pinger_colours": rescued_colours,
             "label": "Scout %d" % ROBOT_ID,
         }], filename="slam_map_%d.png" % ROBOT_ID)
+        # Final refresh of the shared global map (our last state included).
+        emit_global_maps(staged=True)
         break
 
     # ── Continuous market: bid on EVERY beacon I can hear (whether idle

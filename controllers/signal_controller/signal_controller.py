@@ -62,6 +62,7 @@ SCOUT_TEMPLATE = (
     'DEF SCOUT_%d E-puck { '
     'translation %.3f %.3f 0 rotation 0 0 1 %.3f '
     'name "scout_%d" controller "robot_controller" '
+    'controllerArgs [ "%.3f" "%.3f" ] '          # world start → shared global map frame
     'emitter_channel 2 receiver_channel 1 '
     'turretSlot [ '
     'Lidar { translation 0 0 0.02 horizontalResolution 360 '
@@ -82,7 +83,7 @@ for i in range(NUM_ROBOTS):
         sx = CLUSTER_RADIUS * math.cos(ang)
         sy = CLUSTER_RADIUS * math.sin(ang)
     root_children.importMFNodeFromString(
-        -1, SCOUT_TEMPLATE % (i, sx, sy, ang, i))
+        -1, SCOUT_TEMPLATE % (i, sx, sy, ang, i, sx, sy))
     scout_nodes.append(robot.getFromDef("SCOUT_%d" % i))
     scout_start.append((sx, sy))
 print("[manager] spawned %d scouts clustered at centre (r=%.2f m)"
