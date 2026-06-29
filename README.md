@@ -158,3 +158,6 @@ See `benchmark/README.md` for the full sweep.
   ring, the fixed-priority yield rule can deadlock and stall a run. It strikes a
   minority of seeds and inflates the variance rather than the peak numbers.
 - **Simulation only**, with an idealized radio model (clean range and bearing).
+
+
+**Small Remark**: code documentation (structured comments) is refactored using LLMs to ensure no piece of code is left unexplained. Additionally, code (including functions) was also optimized using AI for simplicity, efficiency and comprehension. Nonetheless, the code remains of our authorship, and is ALWAYS manually checked whenever any of the afforementioned changes happen. 
