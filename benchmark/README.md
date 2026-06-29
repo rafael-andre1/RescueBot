@@ -11,7 +11,7 @@ article-ready figures and a saturation summary.
 | robots    | 1, 2, 3, 4, 5                     | `RESCUE_ROBOTS`         |
 | interval  | 5, 10, 15, 20, 25, 30 s (median)  | `RESCUE_INTERVAL`       |
 | seed      | 0, 1, 2                           | `RESCUE_SEED`           |
-| run length| 300 sim-seconds                   | `RESCUE_RUN_SECONDS`    |
+| run length| 600 sim-seconds                   | `RESCUE_RUN_SECONDS`    |
 | gap std   | 0.3 × interval (Gaussian)         | `RESCUE_STD`            |
 | csv out   | `benchmark/results.csv`           | `RESCUE_RESULT_CSV`     |
 
