@@ -1,11 +1,11 @@
 #!/usr/bin/env python3
 """
-run_sweep.py — batch benchmark runner for RescueBot.
+Batch runner for the RescueBot benchmark.
 
-Sweeps (map x robots x spawn-interval x seed), launching Webots headless once
-per config. The signal_controller reads the config from RESCUE_* env vars,
-runs for RUN_SECONDS sim-seconds, appends one metrics row to a CSV, then calls
-simulationQuit so this script can move to the next config.
+Walks every (map, robots, spawn-interval, seed) combo and fires up a headless
+Webots for each one. signal_controller picks the config out of the RESCUE_* env
+vars, runs for RUN_SECONDS, writes one row of metrics to a CSV, then quits itself
+so we can launch the next.
 
 Usage:
     python3 benchmark/run_sweep.py                 # full sweep (sequential)

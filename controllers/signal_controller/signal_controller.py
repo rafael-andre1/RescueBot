@@ -34,9 +34,9 @@ from controller import Supervisor
 
 import bench_maps
 
-# ─── Benchmark / reproducibility config (all overridable via env) ───
-# The benchmark harness sets these per run; defaults reproduce normal
-# interactive behaviour.
+# ─── benchmark knobs, all overridable from the environment ───
+# the sweep sets these per run. the defaults just give the normal interactive
+# behaviour you get when you hit play.
 SEED         = int(os.environ.get("RESCUE_SEED", "42"))
 random.seed(SEED)
 MAP_NAME     = os.environ.get("RESCUE_MAP", "medium")     # easy | medium | hard
@@ -52,10 +52,10 @@ BEACON_MIN_GAP  = 0.5        # clamp so a Gaussian draw never gives ≤0 s
 AUCTION_WINDOW  = 2.0        # bid-collection time before the FIRST assignment (s)
 RESCUE_RADIUS   = 0.40       # assigned robot within this → rescued (m)
 
-# Scouts resolve a ping within RADIO_STOP_DIST once their camera confirms its
-# colour. Beacons are spawned at least 2x that apart so a scout can never have
-# two pings inside its resolution radius at once — the beacon it sees is always
-# unambiguous, which is what makes opportunistic (resolve-on-sight) safe.
+# a scout resolves a ping inside RADIO_STOP_DIST once the camera confirms the
+# colour. beacons spawn at least 2x that apart, so a scout is never inside two
+# resolution radii at the same time and the one it sees is always the right one.
+# that is what keeps resolve-on-sight safe.
 RADIO_STOP_DIST = 0.80
 MIN_BEACON_SEP  = 2.0 * RADIO_STOP_DIST   # 1.6 m centre-to-centre
 BID_FRESHNESS   = 3.0        # ignore bids older than this (s)
@@ -85,7 +85,7 @@ SCOUT_TEMPLATE = (
     'DEF SCOUT_%d E-puck { '
     'translation %.3f %.3f 0 rotation 0 0 1 %.3f '
     'name "scout_%d" controller "robot_controller" '
-    'controllerArgs [ "%.3f" "%.3f" ] '          # world start → shared global map frame
+    'controllerArgs [ "%.3f" "%.3f" ] '          # world start, lets the robots share one map frame
     'emitter_channel 2 receiver_channel 1 '
     'turretSlot [ '
     'Lidar { translation 0 0 0.02 horizontalResolution 360 '
@@ -188,10 +188,10 @@ def _position_clear(x, y):
 
 
 def _safe_position(active_positions):
-    """Random position clear of walls AND at least MIN_BEACON_SEP from every
-    currently-active beacon. Returns None if no such spot is found (arena too
-    full right now) — the caller defers the spawn rather than placing one too
-    close, which would break the resolve-on-sight guarantee."""
+    """Pick a random spot that clears the walls and sits at least MIN_BEACON_SEP
+    from every live beacon. Returns None when nothing fits (arena too crowded);
+    the caller then waits and retries instead of cramming one in too close and
+    breaking the resolve-on-sight guarantee."""
     sep2 = MIN_BEACON_SEP ** 2
     for _ in range(200):
         x = random.uniform(*X_RANGE)
@@ -250,13 +250,13 @@ def write_result_row():
 while robot.step(TIME_STEP) != -1:
     t = robot.getTime()
 
-    # ── Activate the next beacon (they accumulate). Inter-spawn gap is
-    #    Gaussian: median = BEACON_INTERVAL, std = BEACON_STD. ─────────
+    # drop the next beacon (they pile up). the gap to the next one is Gaussian,
+    # median = BEACON_INTERVAL, std = BEACON_STD.
     if (NUM_GOALS == 0 or spawned < NUM_GOALS) and t >= next_spawn_t:
-        # Keep every new beacon >= MIN_BEACON_SEP from all CURRENTLY-active ones
-        # (rescued beacons are gone, so they free up space). If the arena is too
-        # crowded right now, defer: leave `spawned` unchanged so we retry next
-        # step and place it the moment a rescue opens room.
+        # keep every new beacon >= MIN_BEACON_SEP from the ones still active
+        # (rescued ones are gone, so they free up room). if it is too crowded
+        # right now, leave `spawned` alone and retry next step, so it drops in
+        # the moment a rescue opens space.
         active_positions = [beacon_pos[bb] for bb in beacon_pos if bb not in rescued]
         spot = _safe_position(active_positions)
         if spot is not None:
@@ -273,16 +273,16 @@ while robot.step(TIME_STEP) != -1:
             print("[manager] beacon %d ACTIVE at (%+.2f, %+.2f) colour=%s  t=%.1f s"
                   % (spawned, bx, by, col_name, t))
             spawned += 1
-            # Schedule the next spawn only on success — Gaussian gap compounds
-            # off the ACTUAL spawn time. (If a spawn was deferred for crowding,
-            # next_spawn_t is unchanged, so it keeps retrying every step.)
+            # only schedule the next one after a real drop, so the Gaussian gap
+            # counts from the actual spawn time. a deferred spawn leaves
+            # next_spawn_t alone and just keeps retrying every step.
             next_spawn_t = t + max(BEACON_MIN_GAP,
                                    random.gauss(BEACON_INTERVAL, BEACON_STD))
 
-    # ── Collect bids + rescue declarations ──────────────────────────
-    #   A robot declares "RESOLVED <robot> <beacon>" once it is within range
-    #   AND its camera has confirmed the beacon's colour (same rule as the
-    #   swarm) — we honour that rather than waiting for it to physically touch.
+    # collect bids and rescue declarations.
+    # a robot sends "RESOLVED <robot> <beacon>" once it is in range and the
+    # camera has confirmed the colour (same rule as the swarm). we take its word
+    # for it instead of waiting for it to physically bump the beacon.
     resolved_decls = set()
     while auction_rx.getQueueLength() > 0:
         try:
@@ -373,11 +373,11 @@ while robot.step(TIME_STEP) != -1:
         else:
             auction_tx.send(("TASK %d %d %s" % (r, b, beacon_colour[b])).encode("utf-8"))
 
-    # ── (4) Rescue: a beacon is resolved when ANY scout DECLARES it (in range
-    #        + camera-confirmed colour) — opportunistic, so a passing scout can
-    #        resolve a beacon that isn't its assignment, or one that's still
-    #        unassigned. A ground-truth proximity check on the assignee is kept
-    #        only as a safety fallback so the mission can never stall. ────────
+    # (4) rescue. a beacon is done the moment ANY scout declares it (in range,
+    #     colour confirmed). that is the opportunistic part: a scout passing by
+    #     can clear a beacon that is not its own, or one nobody was assigned. the
+    #     ground-truth proximity check on the assignee is just a fallback so the
+    #     run cannot stall if a declaration goes missing.
     for b in list(active):
         a = assignee.get(b)                       # current assignee (may be None)
         # Resolver = the declaring scout if any, else the assignee (fallback).
@@ -409,7 +409,7 @@ while robot.step(TIME_STEP) != -1:
         last_backlog_t = t
         backlog_samples.append(len([b for b in beacon_pos if b not in rescued]))
 
-    # ── Benchmark: timed auto-exit → write CSV row, close Webots ────
+    # benchmark: time is up. write the CSV row and close Webots.
     if RUN_SECONDS > 0 and t >= RUN_SECONDS:
         if RESULT_CSV:
             write_result_row()

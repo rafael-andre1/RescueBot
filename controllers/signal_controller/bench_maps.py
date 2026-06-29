@@ -1,15 +1,15 @@
 """
-bench_maps.py — wall layouts for the benchmark, keyed by difficulty.
+Wall layouts for the benchmark, one list per difficulty.
 
-Each wall is (centre_x, centre_y, size_x, size_y) in metres; height is fixed.
-The signal_controller spawns these as Solid boxes at startup (so one world
-file serves all three maps — the map is chosen via the RESCUE_MAP env var)
-and also uses them to keep beacons clear of walls.
+A wall is (centre_x, centre_y, size_x, size_y) in metres, height is fixed.
+signal_controller spawns these as Solid boxes at startup, so the single world
+file covers all three maps (pick one with the RESCUE_MAP env var). It also reads
+the same list to keep beacons from spawning on top of a wall.
 
-  easy   — nearly open, 2 short walls
-  medium — the original 7-wall arena
-  hard   — serpentine maze with dead-end stubs (centre kept clear so the
-           scouts' spawn ring never lands on a wall)
+  easy:   almost open, just two short walls
+  medium: the original 7-wall arena
+  hard:   serpentine maze with dead-end stubs. the centre is left clear so the
+          spawn ring never drops a robot onto a wall
 """
 
 WALL_HEIGHT = 0.3

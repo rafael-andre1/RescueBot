@@ -1,25 +1,20 @@
 #!/usr/bin/env python3
 """
-render_global_map.py — regenerate the ONE global map offline.
+Rebuild the global map from saved state, no sim run needed.
 
-The RescueBot controllers continuously pickle their SLAM state to
-``slam_state_<id>.pkl`` (occupancy grid + world start_pos + trajectory +
-camera-identified rescues). This script merges every state file the same way
-robot_controller.save_global_map does — into one shared world frame centred on
-the world origin — and writes the two galleries WITHOUT rerunning the
-simulation:
+Each robot drops its SLAM state to slam_state_<id>.pkl while it runs: the grid,
+its world start, the path it took, and the pings it confirmed. This reads all of
+them back, stitches them into one map centred on the world origin, and writes
+both versions:
 
-    maps_traj/global_map.png         full map: obstacles + trajectories + starts
-                                     + stop points + dashed links + camera-coloured pings
-    clean_maps/global_clean_map.png  obstacles + camera-coloured pings ONLY
+    maps_traj/global_map.png         walls + paths + starts + stops + pings
+    clean_maps/global_clean_map.png  walls + pings only
 
-Both use a legend placed OUTSIDE the plot so it never covers a ping.
+The legend sits to the right of the plot in both, so it can't land on a ping.
 
-Usage:
     python render_global_map.py [state_dir] [--clean-only] [--traj-only]
 
-`state_dir` defaults to this script's own directory (where the controller
-drops the pickles). Output dirs are created next to the state files.
+state_dir defaults to this file's folder, which is where the pickles end up.
 """
 import os
 import sys
@@ -33,8 +28,8 @@ import matplotlib.pyplot as plt
 import matplotlib.patches as mpatches
 from matplotlib.lines import Line2D
 
-# ── Constants — MUST match robot_controller.py so the offline render is
-#    identical to the live one. ──────────────────────────────────────────
+# these have to match robot_controller.py, otherwise the offline map comes
+# out looking different from the one the sim drew
 MAP_SIZE       = 200
 MAP_CENTRE     = MAP_SIZE // 2
 WORLD_X_MAX    = 4.0
@@ -47,10 +42,11 @@ STATE_GLOB     = "slam_state_*.pkl"
 MAPS_TRAJ_DIR  = "maps_traj"
 CLEAN_MAPS_DIR = "clean_maps"
 
-# Beacon markers ALWAYS in the camera-identified colour.
+# beacon dots always take the colour the camera read off the box
 COLOUR_MPL = {"red": "red", "yellow": "gold", "green": "limegreen"}
 
-# Fixed per-robot colour (never a beacon colour) — same dict as the controller.
+# one fixed colour per robot, kept off red/yellow/green so a path never reads
+# as a ping. same dict the controller uses
 ROBOT_TRAJ_COLOURS = {
     0: "tab:purple",
     1: "tab:orange",
@@ -84,8 +80,7 @@ def load_all_states(state_dir):
 
 
 def save_global_map(robot_maps, filename, ref_start, clean=False):
-    """Identical merge + render to robot_controller.save_global_map, with the
-    legend outside the axes in BOTH galleries."""
+    """Same merge and render the controller does, legend pushed off to the side."""
     rsx, rsy = ref_start
 
     g_hits   = np.zeros((MAP_SIZE, MAP_SIZE), dtype=np.int32)
@@ -139,7 +134,7 @@ def save_global_map(robot_maps, filename, ref_start, clean=False):
     total_rescues = 0
     seen_colours  = set()
 
-    # Beacon (ping) markers — both galleries — in the camera-identified colour.
+    # ping stars, on both versions, coloured by whatever the camera called it
     for rm in robot_maps:
         sx, sy = rm["start_pos"]
         sxr, syr = sx - rsx, sy - rsy
@@ -161,7 +156,7 @@ def save_global_map(robot_maps, filename, ref_start, clean=False):
                        markerfacecolor=COLOUR_MPL[cname], markeredgecolor="black",
                        markersize=12, label="%s beacon (camera id)" % cname))
 
-    # Trajectories + starts + stop points + dashed links (full gallery only).
+    # paths, starts, stop circles and the dashed link, only on the full map
     if not clean:
         for idx, rm in enumerate(robot_maps):
             rid = rm.get("id", idx)
@@ -210,7 +205,7 @@ def save_global_map(robot_maps, filename, ref_start, clean=False):
                      % (total_rescues, "s" if total_rescues != 1 else ""),
                      fontsize=11)
 
-    # Legend OUTSIDE the axes (right column) in BOTH galleries.
+    # legend off to the right on both, so it never lands on the map
     ax.legend(handles=legend_handles, bbox_to_anchor=(1.02, 1.0),
               loc="upper left", borderaxespad=0.0,
               fontsize=8, framealpha=0.95, edgecolor="gray")

@@ -1,21 +1,20 @@
 #!/usr/bin/env python3
 """
-plot_results.py — turn benchmark/results.csv into article-ready figures + a
-text summary you can paste into the results/conclusion of the paper.
+Turn benchmark/results.csv into figures and a short text summary.
 
-For each map it draws three panels vs the goal spawn-interval, one line per
-robot count, averaged over seeds (error bars = std across seeds):
+For each map it draws three panels against the goal spawn-interval, one line per
+robot count, averaged over the seeds (error bars are the std across seeds):
 
-    throughput  (rescues/min)   — how much work the team clears
-    mean latency (s)            — spawn→rescue delay (responsiveness)
-    mean backlog (#)            — queue length (saturation indicator)
+    throughput  (rescues/min)   how much the team clears
+    mean latency (s)            spawn-to-rescue delay
+    mean backlog (#)            how long the queue gets
 
-It also prints, per (map, robots), the saturation point: the smallest spawn
-RATE (largest interval handled) before backlog/latency blow up.
+It also prints, per (map, robots), the largest interval each team keeps stable
+before backlog and latency blow up.
 
-Usage:
     python3 benchmark/plot_results.py [results.csv]
-Output: benchmark/figures/*.png
+
+Writes benchmark/figures/*.png
 """
 import os
 import sys
