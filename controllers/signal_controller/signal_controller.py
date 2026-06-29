@@ -1,30 +1,3 @@
-"""
-signal_controller — Supervisor: spawner + auctioneer for the multi-robot
-rescue mission.
-
-At startup it spawns NUM_ROBOTS scouts clustered around the arena centre,
-then activates NUM_GOALS distress beacons one every BEACON_INTERVAL
-seconds at random positions. Beacons accumulate: one NEVER disappears
-until its assigned scout physically reaches it.
-
-Auction (sealed-bid, blocking):
-  • Each beacon broadcasts "SOS <id>" on channel 1 (its own emitter).
-  • Idle scouts hear it, estimate the goal from bearing+strength, and bid
-    their theoretical path cost over channel 2: "BID <beacon> <robot> <cost>".
-    (Cost = known-map Dijkstra to the known cell closest to the estimate,
-    plus 1.5× straight-line for the unknown remainder — computed scout-side.)
-  • After AUCTION_WINDOW seconds of bidding the manager awards the beacon
-    to the LOWEST fresh bid from a free robot: "AWARD <beacon> <robot>".
-  • Awards are BLOCKING — the beacon belongs to that robot until rescued.
-    No exchange, no re-auction. A busy robot never receives a second award.
-  • Rescue = assigned robot within RESCUE_RADIUS of the beacon (measured
-    with supervisor ground truth). The beacon node is then removed and the
-    robot freed for future auctions.
-
-When all NUM_GOALS beacons have been spawned and rescued, the manager
-broadcasts "DONE" for a couple of seconds (so every scout saves its map
-and exits) and stops.
-"""
 import os
 import csv
 import math
